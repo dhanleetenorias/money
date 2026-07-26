@@ -50,6 +50,10 @@ function daysWord(n) {
 
 /** One sentence from a budget.paceDelta() result. */
 function paceLine(pace) {
+  // Nothing spent yet: "you're ₱11,664 ahead of pace" is arithmetically true
+  // but meaningless — on the 27th of an untouched month it just reads as
+  // noise. Say nothing until there's something to compare against.
+  if (!pace.actualCent) return null;
   if (pace.state === "ahead") {
     return {
       cls: "pace-ahead",
@@ -63,14 +67,18 @@ function paceLine(pace) {
 }
 
 function renderPace(pace) {
-  const { cls, text } = paceLine(pace);
-  return `<p class="pace ${cls}">${esc(text)}</p>`;
+  const line = paceLine(pace);
+  if (!line) return "";
+  return `<p class="pace ${line.cls}">${esc(line.text)}</p>`;
 }
 
 /** One envelope row: name, bar with pace tick, % micro-label, ₱ left. */
 function renderEnvRow(env, paceTick) {
   const fillRatio = Math.max(0, Math.min(1, env.ratio));
-  const pctLabel = Math.round(Math.min(env.ratio, 99) * 100);
+  // The micro-label is the envelope's ALLOCATION share ("30%"), which is fixed
+  // and identifies the envelope. Using env.ratio here showed spend-so-far, so
+  // every row read "0%" on a fresh month.
+  const pctLabel = Math.round(Number(env.pct) || 0);
   const tickPct = (Math.max(0, Math.min(1, paceTick)) * 100).toFixed(2);
   const overLine = env.over
     ? `<span class="env-over">Over by ${fmt(env.overCent)}</span>`
