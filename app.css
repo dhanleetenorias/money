@@ -1,29 +1,39 @@
 /* MONEY — dark, one-handed, glanceable. Classes match js/render.js exactly.
-   P0 scaffold: tokens + base only. P2b (visual pass) owns everything below
-   @layer layout — do not add component styles here before then. */
+   Layers: tokens (palette + scale) → base (resets) → layout (screen scaffold)
+   → components (everything visible).
+   Perf rails: only transform / opacity / stroke-dashoffset ever animate.
+   Bars grow via scaleX, never width. No width animation inside flex rows. */
 
 @layer tokens, base, layout, components;
 
+/* ---------------------------------------------------------------- tokens */
 @layer tokens {
   :root {
+    color-scheme: dark;
+
     --bg: #0d0f0e;
     --surface: #16191a;
     --surface-2: #1e2224;
     --border: #2a2f31;
-    --text: #f2f5f4;
-    --dim: #9ba3a1;
-    --faint: #8a9391; /* 4.5:1 on --surface — AA at any size */
+    --track: #262b2d; /* bar rails — one step above surface-2 so fills pop */
+    --text: #f2f5f4; /* 17.5:1 on --bg */
+    --dim: #9ba3a1; /* 7.5:1 on --bg, 6.2:1 on --surface-2 */
+    --faint: #8a9391; /* 5.6:1 on --surface — AA at any size */
 
     /* Budget state colours. NEVER used alone — always paired with an icon or
        a text label (deuteranopia-safe requirement). */
-    --safe: #34d399;
+    --safe: #34d399; /* 10.0:1 on --bg */
     --safe-ink: #0d0f0e;
-    --caution: #fbbf24;
-    --over: #f87171;
+    --caution: #fbbf24; /* 11.5:1 on --bg */
+    --over: #f87171; /* 7.0:1 on --bg */
     --vault: #60a5fa; /* Save/Invest — deliberately NOT a state colour */
 
     --accent: var(--safe);
     --accent-ink: var(--safe-ink);
+
+    --backdrop: rgba(5, 7, 6, 0.55);
+    --shadow-raise: 0 6px 18px rgba(0, 0, 0, 0.35);
+    --shadow-float: 0 10px 32px rgba(0, 0, 0, 0.45);
 
     --s1: 4px;
     --s2: 8px;
@@ -35,6 +45,7 @@
     --r2: 8px;
     --r3: 12px;
     --r4: 16px;
+    --r5: 20px;
     --tap: 48px;
 
     --t-micro: 120ms;
@@ -44,8 +55,37 @@
     --font:
       -apple-system, BlinkMacSystemFont, "SF Pro Text", system-ui, sans-serif;
   }
+
+  /* Separate light palette, NOT an inversion — every pair re-verified.
+     text 16.5:1 · dim 6.0:1 · faint 5.1:1 · safe 5.5:1 · caution 5.2:1 ·
+     over 6.5:1 · vault 6.7:1 (all vs --surface, white). */
+  @media (prefers-color-scheme: light) {
+    :root {
+      color-scheme: light;
+
+      --bg: #f2f4f3;
+      --surface: #ffffff;
+      --surface-2: #e9edeb;
+      --border: #d6dcda;
+      --track: #e3e8e6;
+      --text: #1b201f;
+      --dim: #5b6663;
+      --faint: #647070;
+
+      --safe: #047857;
+      --safe-ink: #ffffff;
+      --caution: #946200;
+      --over: #b91c1c;
+      --vault: #1d4ed8;
+
+      --backdrop: rgba(27, 32, 31, 0.4);
+      --shadow-raise: 0 4px 14px rgba(27, 32, 31, 0.12);
+      --shadow-float: 0 10px 28px rgba(27, 32, 31, 0.18);
+    }
+  }
 }
 
+/* ------------------------------------------------------------------ base */
 @layer base {
   * {
     box-sizing: border-box;
@@ -82,6 +122,8 @@
     cursor: pointer;
     touch-action: manipulation;
     min-height: var(--tap);
+    -webkit-user-select: none;
+    user-select: none;
   }
 
   /* <16px forces iOS to zoom on focus — never go below. */
@@ -92,6 +134,11 @@
     color: inherit;
     background: none;
     border: 0;
+  }
+
+  :focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
   }
 
   /* Every peso figure must use tabular digits so columns line up and numbers
@@ -109,5 +156,604 @@
       animation-iteration-count: 1 !important;
       transition-duration: 0.01ms !important;
     }
+  }
+}
+
+/* ---------------------------------------------------------------- layout */
+@layer layout {
+  .screen {
+    flex: 1;
+    min-height: 0;
+    overflow-y: auto;
+    -webkit-overflow-scrolling: touch;
+    overscroll-behavior: contain;
+    display: flex;
+    flex-direction: column;
+    padding-inline: var(--s4);
+    padding-bottom: calc(
+      var(--tap) + var(--s6) + max(var(--s4), env(safe-area-inset-bottom))
+    );
+  }
+
+  /* Secondary screens share the scaffold; nothing screen-specific needed. */
+  .screen-home,
+  .screen-add,
+  .screen-income,
+  .screen-settings,
+  .screen-history {
+    gap: var(--s4);
+  }
+
+  .topbar {
+    display: flex;
+    align-items: center;
+    gap: var(--s2);
+    min-height: var(--tap);
+    padding-top: max(var(--s3), env(safe-area-inset-top));
+    margin-inline: calc(var(--s4) * -1);
+    padding-inline: var(--s4);
+  }
+  .topbar > :last-child {
+    margin-left: auto;
+  }
+}
+
+/* ------------------------------------------------------------ components */
+@layer components {
+  /* ---------- entrance keyframes (transform/opacity only) ---------- */
+  @keyframes rise-in {
+    from {
+      opacity: 0;
+      transform: translateY(8px);
+    }
+    to {
+      opacity: 1;
+      transform: translateY(0);
+    }
+  }
+  @keyframes bar-in {
+    from {
+      transform: scaleX(0);
+    }
+    to {
+      transform: scaleX(1);
+    }
+  }
+  @keyframes fade-in {
+    from {
+      opacity: 0;
+    }
+    to {
+      opacity: 1;
+    }
+  }
+  @keyframes sheet-up {
+    from {
+      transform: translateY(100%);
+    }
+    to {
+      transform: translateY(0);
+    }
+  }
+  @keyframes toast-up {
+    from {
+      opacity: 0;
+      transform: translateY(12px);
+    }
+    to {
+      opacity: 1;
+      transform: translateY(0);
+    }
+  }
+
+  /* ---------- topbar chips ---------- */
+  .month-chip {
+    font-size: 17px;
+    font-weight: 700;
+    letter-spacing: -0.01em;
+  }
+  .income-chip {
+    font-size: 13px;
+    font-weight: 500;
+    color: var(--dim);
+  }
+
+  /* ---------- vault: banked, calm, precious — not a progress bar ---------- */
+  .vault {
+    position: relative;
+    display: grid;
+    grid-template-columns: 1fr auto;
+    align-items: baseline;
+    row-gap: var(--s1);
+    column-gap: var(--s2);
+    padding: var(--s4) var(--s4) var(--s4) var(--s4);
+    border-radius: var(--r4);
+    background: linear-gradient(
+      135deg,
+      color-mix(in srgb, var(--vault) 13%, var(--surface)),
+      color-mix(in srgb, var(--vault) 4%, var(--surface)) 70%
+    );
+    border: 1px solid color-mix(in srgb, var(--vault) 28%, var(--border));
+    animation: rise-in var(--t-overlay) var(--ease) backwards;
+  }
+  .vault-label {
+    grid-column: 1 / -1;
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 0.09em;
+    text-transform: uppercase;
+    color: var(--vault); /* 6.0:1 on the tinted surface */
+  }
+  .vault-amt {
+    font-size: 26px;
+    font-weight: 700;
+    letter-spacing: -0.01em;
+    font-variant-numeric: lining-nums tabular-nums;
+  }
+  .vault-pct {
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--dim);
+    font-variant-numeric: lining-nums tabular-nums;
+  }
+
+  /* ---------- hero: the one number that matters ---------- */
+  .hero {
+    text-align: center;
+    padding-block: var(--s5) var(--s4);
+    animation: rise-in var(--t-overlay) var(--ease) 60ms backwards;
+  }
+  .hero-label {
+    font-size: 12px;
+    font-weight: 600;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--faint);
+  }
+  .hero-amt {
+    display: block;
+    margin-top: var(--s1);
+    font-size: clamp(46px, 15vw, 60px);
+    font-weight: 700;
+    line-height: 1.05;
+    letter-spacing: -0.025em;
+    font-variant-numeric: lining-nums tabular-nums;
+  }
+  .hero-sub {
+    margin-top: var(--s2);
+    font-size: 14px;
+    color: var(--dim);
+    font-variant-numeric: lining-nums tabular-nums;
+  }
+
+  /* Pace verdict line. State is colour + wording (markup carries the words),
+     over additionally gains weight so it reads without colour. */
+  .pace {
+    margin-top: var(--s2);
+    font-size: 13px;
+    font-weight: 500;
+  }
+  .pace-ahead {
+    color: var(--safe);
+  }
+  .pace-on {
+    color: var(--dim);
+  }
+  .pace-over {
+    color: var(--over);
+    font-weight: 700;
+  }
+
+  /* ---------- envelopes ---------- */
+  .envelopes {
+    display: flex;
+    flex-direction: column;
+  }
+
+  /* Row: name | bar | amt | pct. Fixed side columns keep every bar starting
+     and ending on the same x — the bars read as one aligned instrument. */
+  .env {
+    display: flex;
+    align-items: center;
+    gap: var(--s3);
+    min-height: var(--tap);
+    animation: fade-in var(--t-small) var(--ease) backwards;
+  }
+  .env-name {
+    flex: 0 0 3.4em;
+    font-size: 14px;
+    font-weight: 600;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .env-bar {
+    position: relative;
+    flex: 1;
+    height: 10px;
+    border-radius: 999px;
+    background: var(--track);
+    /* No overflow:hidden — the pace tick overhangs the bar on purpose. */
+  }
+  .env-fill {
+    position: absolute;
+    inset: 0;
+    border-radius: inherit;
+    background: var(--safe);
+    transform-origin: left center;
+    animation: bar-in 480ms var(--ease) backwards;
+  }
+  .env-amt {
+    flex: 0 0 4.4em;
+    text-align: right;
+    font-size: 14px;
+    font-weight: 600;
+    font-variant-numeric: lining-nums tabular-nums;
+  }
+  .env-pct {
+    flex: 0 0 2.4em;
+    text-align: right;
+    font-size: 12px;
+    color: var(--faint);
+    font-variant-numeric: lining-nums tabular-nums;
+  }
+
+  /* Pace tick: a ruler mark, not a stripe. A 2px light rule flanked by 2px
+     notches of page background, overhanging the bar 3px top and bottom —
+     the notch separates it from fill AND track, the overhang says "measured
+     against", and fill-vs-tick position reads as ahead/behind instantly. */
+  .env-tick {
+    position: absolute;
+    top: -3px;
+    bottom: -3px;
+    width: 2px;
+    transform: translateX(-50%);
+    background: var(--text);
+    border-inline: 2px solid var(--bg);
+    background-clip: padding-box;
+    box-sizing: content-box;
+    border-radius: 1px;
+    pointer-events: none;
+    z-index: 1;
+  }
+
+  /* State system: one hue family shift, same geometry. Colour never stands
+     alone — caution dims the fill's certainty, over adds hatching + label. */
+  .env--safe .env-fill {
+    background: var(--safe);
+  }
+  .env--caution .env-fill {
+    background: var(--caution);
+  }
+  .env--caution .env-amt {
+    color: var(--caution);
+  }
+  .env--over .env-fill {
+    background: var(--over);
+    /* Diagonal hatch = non-colour overspend signal, visible to everyone. */
+    background-image: repeating-linear-gradient(
+      -45deg,
+      rgba(0, 0, 0, 0.3) 0 3px,
+      transparent 3px 7px
+    );
+  }
+  .env--over .env-name,
+  .env--over .env-amt {
+    color: var(--over);
+    font-weight: 700;
+  }
+
+  /* Tiny "over" pill — the explicit word, so state is never colour alone. */
+  .env-over {
+    flex: none;
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: var(--over);
+    border: 1px solid color-mix(in srgb, var(--over) 45%, var(--border));
+    border-radius: 999px;
+    padding: 1px var(--s2);
+  }
+
+  /* Load stagger: rows settle top-to-bottom, 45ms apart. */
+  .env:nth-child(1),
+  .env:nth-child(1) .env-fill {
+    animation-delay: 120ms;
+  }
+  .env:nth-child(2),
+  .env:nth-child(2) .env-fill {
+    animation-delay: 165ms;
+  }
+  .env:nth-child(3),
+  .env:nth-child(3) .env-fill {
+    animation-delay: 210ms;
+  }
+  .env:nth-child(4),
+  .env:nth-child(4) .env-fill {
+    animation-delay: 255ms;
+  }
+  .env:nth-child(5),
+  .env:nth-child(5) .env-fill {
+    animation-delay: 300ms;
+  }
+  .env:nth-child(6),
+  .env:nth-child(6) .env-fill {
+    animation-delay: 345ms;
+  }
+  .env:nth-child(7),
+  .env:nth-child(7) .env-fill {
+    animation-delay: 390ms;
+  }
+  .env:nth-child(n + 8),
+  .env:nth-child(n + 8) .env-fill {
+    animation-delay: 435ms;
+  }
+
+  /* ---------- FAB ---------- */
+  .fab {
+    position: fixed;
+    right: var(--s4);
+    bottom: max(var(--s4), env(safe-area-inset-bottom));
+    z-index: 40;
+    width: 56px;
+    height: 56px;
+    min-height: 56px;
+    border-radius: 50%;
+    background: var(--accent);
+    color: var(--accent-ink);
+    font-size: 28px;
+    font-weight: 600;
+    line-height: 1;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    box-shadow: var(--shadow-raise);
+    transition: transform var(--t-micro) var(--ease);
+  }
+  .fab:active {
+    transform: scale(0.92);
+  }
+
+  /* ---------- bottom sheet ---------- */
+  .sheet {
+    position: fixed;
+    inset: 0;
+    z-index: 50;
+    display: flex;
+    flex-direction: column;
+    justify-content: flex-end;
+  }
+  .sheet-backdrop {
+    position: absolute;
+    inset: 0;
+    background: var(--backdrop);
+    animation: fade-in var(--t-overlay) var(--ease) backwards;
+  }
+  .sheet-panel {
+    position: relative;
+    background: var(--surface);
+    border-radius: var(--r5) var(--r5) 0 0;
+    padding: var(--s5) var(--s4);
+    padding-bottom: max(var(--s5), env(safe-area-inset-bottom));
+    box-shadow: var(--shadow-float);
+    animation: sheet-up var(--t-overlay) var(--ease) backwards;
+    max-height: 88dvh;
+    overflow-y: auto;
+    -webkit-overflow-scrolling: touch;
+    overscroll-behavior: contain;
+  }
+  /* Grab handle */
+  .sheet-panel::before {
+    content: "";
+    position: absolute;
+    top: var(--s2);
+    left: 50%;
+    transform: translateX(-50%);
+    width: 36px;
+    height: 4px;
+    border-radius: 999px;
+    background: var(--border);
+  }
+  .sheet-title {
+    font-size: 16px;
+    font-weight: 700;
+    margin-bottom: var(--s4);
+  }
+
+  /* ---------- amount entry ---------- */
+  .amount-input {
+    width: 100%;
+    text-align: center;
+    font-size: 44px;
+    font-weight: 700;
+    letter-spacing: -0.02em;
+    font-variant-numeric: lining-nums tabular-nums;
+    caret-color: var(--accent);
+    padding-block: var(--s3);
+    min-height: var(--tap);
+  }
+  .amount-input::placeholder {
+    color: var(--faint);
+  }
+
+  .chips {
+    display: flex;
+    gap: var(--s2);
+    overflow-x: auto;
+    padding-block: var(--s2);
+    scrollbar-width: none;
+  }
+  .chips::-webkit-scrollbar {
+    display: none;
+  }
+  .chip {
+    flex: none;
+    min-height: var(--tap);
+    padding: 0 var(--s4);
+    border-radius: 999px;
+    font-size: 14px;
+    font-weight: 600;
+    color: var(--dim);
+    background: var(--surface-2);
+    transition: transform var(--t-micro) var(--ease);
+  }
+  .chip:active {
+    transform: scale(0.95);
+  }
+  .chip--active {
+    background: color-mix(in srgb, var(--accent) 16%, var(--surface-2));
+    color: var(--text);
+    box-shadow: inset 0 0 0 1px var(--accent);
+  }
+
+  .note-row {
+    display: flex;
+    align-items: center;
+    gap: var(--s2);
+    margin-top: var(--s2);
+  }
+  .note-input {
+    flex: 1;
+    min-height: var(--tap);
+    padding: 0 var(--s4);
+    background: var(--surface-2);
+    border-radius: var(--r3);
+  }
+  .note-input::placeholder {
+    color: var(--faint);
+  }
+
+  /* ---------- buttons ---------- */
+  .btn {
+    min-height: var(--tap);
+    padding: 0 var(--s4);
+    border-radius: var(--r3);
+    font-size: 16px;
+    font-weight: 700;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    background: var(--surface-2);
+    transition:
+      transform var(--t-micro) var(--ease),
+      opacity var(--t-micro) var(--ease);
+  }
+  .btn:active {
+    transform: scale(0.97);
+    opacity: 0.85;
+  }
+  .btn-primary {
+    background: var(--accent);
+    color: var(--accent-ink);
+  }
+  .btn-ghost {
+    background: transparent;
+    color: var(--dim);
+    font-weight: 600;
+  }
+  .btn-danger {
+    background: transparent;
+    color: var(--over);
+    font-weight: 600;
+  }
+
+  /* ---------- toast ---------- */
+  .toast {
+    position: fixed;
+    left: var(--s4);
+    right: var(--s4);
+    /* Clears the home indicator AND the FAB. */
+    bottom: calc(max(var(--s4), env(safe-area-inset-bottom)) + 68px);
+    z-index: 60;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--s3);
+    min-height: var(--tap);
+    padding: var(--s2) var(--s2) var(--s2) var(--s4);
+    background: var(--surface-2);
+    border: 1px solid var(--border);
+    border-radius: var(--r3);
+    box-shadow: var(--shadow-raise);
+    animation: toast-up var(--t-overlay) var(--ease) backwards;
+  }
+  .toast-msg {
+    font-size: 14px;
+    font-weight: 500;
+  }
+  .toast-action {
+    flex: none;
+    min-height: 40px;
+    padding: 0 var(--s3);
+    border-radius: var(--r2);
+    font-size: 14px;
+    font-weight: 700;
+    color: var(--accent);
+  }
+
+  /* ---------- empty state ---------- */
+  .empty {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: var(--s4);
+    text-align: center;
+    padding: var(--s6) var(--s5);
+    animation: rise-in var(--t-overlay) var(--ease) backwards;
+  }
+  .empty-title {
+    font-size: 17px;
+    font-weight: 600;
+    color: var(--dim);
+    max-width: 24ch;
+    line-height: 1.4;
+  }
+  .empty-cta {
+    min-height: var(--tap);
+    padding: 0 var(--s5);
+    border-radius: var(--r3);
+    font-size: 16px;
+    font-weight: 700;
+    background: var(--accent);
+    color: var(--accent-ink);
+    transition: transform var(--t-micro) var(--ease);
+  }
+  .empty-cta:active {
+    transform: scale(0.97);
+  }
+
+  /* ---------- history / lists ---------- */
+  .list {
+    display: flex;
+    flex-direction: column;
+    list-style: none;
+  }
+  .list-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--s3);
+    min-height: var(--tap);
+    padding-block: var(--s2);
+    border-bottom: 1px solid color-mix(in srgb, var(--border) 55%, transparent);
+  }
+  .list-row:last-child {
+    border-bottom: 0;
+  }
+  .list-row-main {
+    min-width: 0;
+    font-size: 15px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .list-row-amt {
+    flex: none;
+    font-size: 15px;
+    font-weight: 600;
+    font-variant-numeric: lining-nums tabular-nums;
   }
 }
