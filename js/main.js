@@ -358,6 +358,11 @@ async function commitExpense(catId) {
     deleted: 0,
   };
   await idb.addTxn(txn);
+  // Expenses are the common case and were the ONE commit path not kicking
+  // sync — they sat in the outbox until some other write happened to drain
+  // them. The 3s undo still wins: it deletes the txn and its outbox row, and
+  // a delete that lands after the push is sent as a compensating void.
+  sync.kick();
   closeSheet();
   await renderFull();
 
