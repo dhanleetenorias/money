@@ -1,0 +1,6 @@
+.DS_Store
+apps-script/.clasp.json
+*.local.*
+*.local
+backup*.json
+node_modules/

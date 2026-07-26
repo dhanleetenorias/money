@@ -1,0 +1,113 @@
+/* MONEY — dark, one-handed, glanceable. Classes match js/render.js exactly.
+   P0 scaffold: tokens + base only. P2b (visual pass) owns everything below
+   @layer layout — do not add component styles here before then. */
+
+@layer tokens, base, layout, components;
+
+@layer tokens {
+  :root {
+    --bg: #0d0f0e;
+    --surface: #16191a;
+    --surface-2: #1e2224;
+    --border: #2a2f31;
+    --text: #f2f5f4;
+    --dim: #9ba3a1;
+    --faint: #8a9391; /* 4.5:1 on --surface — AA at any size */
+
+    /* Budget state colours. NEVER used alone — always paired with an icon or
+       a text label (deuteranopia-safe requirement). */
+    --safe: #34d399;
+    --safe-ink: #0d0f0e;
+    --caution: #fbbf24;
+    --over: #f87171;
+    --vault: #60a5fa; /* Save/Invest — deliberately NOT a state colour */
+
+    --accent: var(--safe);
+    --accent-ink: var(--safe-ink);
+
+    --s1: 4px;
+    --s2: 8px;
+    --s3: 12px;
+    --s4: 16px;
+    --s5: 24px;
+    --s6: 32px;
+    --r1: 6px;
+    --r2: 8px;
+    --r3: 12px;
+    --r4: 16px;
+    --tap: 48px;
+
+    --t-micro: 120ms;
+    --t-small: 180ms;
+    --t-overlay: 220ms;
+    --ease: cubic-bezier(0.2, 0, 0, 1);
+    --font:
+      -apple-system, BlinkMacSystemFont, "SF Pro Text", system-ui, sans-serif;
+  }
+}
+
+@layer base {
+  * {
+    box-sizing: border-box;
+    margin: 0;
+    padding: 0;
+  }
+
+  html,
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--font);
+    overflow: hidden;
+    overscroll-behavior: none;
+    height: 100%;
+  }
+
+  body {
+    -webkit-tap-highlight-color: transparent;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  #app {
+    height: 100dvh;
+    display: flex;
+    flex-direction: column;
+  }
+
+  button {
+    font: inherit;
+    color: inherit;
+    background: none;
+    border: 0;
+    cursor: pointer;
+    touch-action: manipulation;
+    min-height: var(--tap);
+  }
+
+  /* <16px forces iOS to zoom on focus — never go below. */
+  input,
+  select {
+    font: inherit;
+    font-size: 16px;
+    color: inherit;
+    background: none;
+    border: 0;
+  }
+
+  /* Every peso figure must use tabular digits so columns line up and numbers
+     don't jitter as they animate. */
+  .num,
+  .amt {
+    font-variant-numeric: lining-nums tabular-nums;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    *,
+    *::before,
+    *::after {
+      animation-duration: 0.01ms !important;
+      animation-iteration-count: 1 !important;
+      transition-duration: 0.01ms !important;
+    }
+  }
+}
