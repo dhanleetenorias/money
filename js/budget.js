@@ -143,6 +143,13 @@ function sumWithdrawals(txns, accept) {
  * Past months are complete (1), future months haven't started (0).
  * A month with an unusable key is treated as complete rather than throwing —
  * corrupt stored data must degrade, not white-screen the dashboard.
+ *
+ * The window starts at `openedAt`, NOT at the 1st. Open a month on the 10th
+ * and the budget covers the 10th onward, so pace must too — measuring from
+ * the 1st would credit nine untracked days of "savings" and report a wild
+ * ahead-of-pace on day one. This also keeps pace consistent with
+ * safeToSpendToday, which already divides by REMAINING days.
+ * A month opened on the 1st is unaffected: the window is the whole month.
  */
 function progressFor(month, now) {
   if (!isMonthKey(month?.key) || now == null) return 1;
@@ -152,8 +159,31 @@ function progressFor(month, now) {
   } catch {
     return 1; // unusable clock — assume the month is done
   }
-  if (month.key === cur) return monthProgress(now);
-  return month.key < cur ? 1 : 0;
+  if (month.key !== cur) return month.key < cur ? 1 : 0;
+
+  const full = monthProgress(now);
+  const start = startProgress(month);
+  if (start <= 0) return full;
+  if (start >= 1) return 1; // opened on the last instant — nothing left to pace
+  return clamp((full - start) / (1 - start), 0, 1);
+}
+
+/**
+ * Elapsed fraction of the month at the moment it was opened, or 0 if that
+ * can't be established (older records predate openedAt; a corrupt value must
+ * degrade to the whole-month window rather than throw).
+ */
+function startProgress(month) {
+  const at = Number(month?.openedAt);
+  if (!Number.isFinite(at) || at <= 0) return 0;
+  try {
+    // An openedAt from another month means the record was edited or imported;
+    // trust the month key over the timestamp.
+    if (ym(at) !== month.key) return 0;
+    return monthProgress(at);
+  } catch {
+    return 0;
+  }
 }
 
 /**

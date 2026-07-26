@@ -36,12 +36,15 @@ function manila(y, m, d, hh = 12, mm = 0) {
   return new Date(Date.UTC(y, m - 1, d, hh - 8, mm, 0));
 }
 
+// Opened at midnight on the 1st so the pace window is the whole month —
+// pace measures from openedAt, and a 9am open would shave 9 hours off every
+// expectation in here. Mid-month opens are covered by their own tests.
 function july(income = INCOME) {
   return newMonthFromSettings(
     SETTINGS,
     "2026-07",
     income,
-    manila(2026, 7, 1, 9).getTime(),
+    manila(2026, 7, 1, 0).getTime(),
   );
 }
 
@@ -803,4 +806,77 @@ test("derived reads survive junk txns and an empty alloc", () => {
   const nonsense = [null, undefined, {}, { cent: "x" }, { kind: "withdrawal" }];
   assert.doesNotThrow(() => vaultState(m, nonsense));
   assert.equal(vaultState(m, nonsense).withdrawnCent, 0);
+});
+
+test("pace measures from openedAt, not from the 1st", () => {
+  // Opening a month mid-month means the budget covers that day onward.
+  // Pacing from the 1st would credit the untracked days as savings and
+  // report a wild ahead-of-pace on day one.
+  const late = newMonthFromSettings(
+    SETTINGS,
+    "2026-08",
+    INCOME,
+    manila(2026, 8, 10, 9).getTime(),
+  );
+
+  // Day one of a mid-month start: nothing is expected yet.
+  assert.equal(paceDelta(late, [], manila(2026, 8, 10, 9)).expectedCent, 0);
+  assert.equal(paceDelta(late, [], manila(2026, 8, 10, 9)).state, "on");
+
+  // The window still reaches ~the full spendable pool by month end.
+  const pool = spendablePool(late, []).allocCent;
+  const end = paceDelta(late, [], manila(2026, 8, 31, 23, 59)).expectedCent;
+  assert.ok(
+    Math.abs(end - pool) < pool * 0.01,
+    `expected ~${pool} by month end, got ${end}`,
+  );
+
+  // Halfway through the REMAINING window is roughly half the pool.
+  const mid = paceDelta(late, [], manila(2026, 8, 21, 0)).expectedCent;
+  assert.ok(
+    Math.abs(mid - pool / 2) < pool * 0.05,
+    `expected ~${pool / 2} halfway, got ${mid}`,
+  );
+});
+
+test("a month opened on the 1st paces across the whole month", () => {
+  const onTime = newMonthFromSettings(
+    SETTINGS,
+    "2026-08",
+    INCOME,
+    manila(2026, 8, 1, 0).getTime(),
+  );
+  const pool = spendablePool(onTime, []).allocCent;
+  const half = paceDelta(onTime, [], manila(2026, 8, 16, 12)).expectedCent;
+  assert.equal(half, Math.round(pool / 2));
+});
+
+test("pace degrades when openedAt is missing or foreign", () => {
+  // Records predating openedAt, and imported ones whose timestamp belongs to
+  // another month, fall back to the whole-month window rather than throwing.
+  const base = newMonthFromSettings(
+    SETTINGS,
+    "2026-08",
+    INCOME,
+    manila(2026, 8, 1, 0).getTime(),
+  );
+  const pool = spendablePool(base, []).allocCent;
+  const expectHalf = Math.round(pool / 2);
+
+  for (const openedAt of [
+    undefined,
+    null,
+    0,
+    NaN,
+    "junk",
+    manila(2026, 3, 4).getTime(),
+  ]) {
+    const m = { ...base, openedAt };
+    assert.doesNotThrow(() => paceDelta(m, [], manila(2026, 8, 16, 12)));
+    assert.equal(
+      paceDelta(m, [], manila(2026, 8, 16, 12)).expectedCent,
+      expectHalf,
+      `openedAt=${String(openedAt)} should use the whole month`,
+    );
+  }
 });
