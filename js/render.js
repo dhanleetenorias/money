@@ -26,7 +26,51 @@
  * @property {Object[]} [envelopes]     budget.allEnvelopes() result
  */
 
-import { fmt } from "./money.js";
+import { fmt, TZ } from "./money.js";
+
+/* ---- date/time display -------------------------------------------------- */
+
+const dtfCache = new Map();
+function dtf(kind) {
+  let f = dtfCache.get(kind);
+  if (f) return f;
+  const base = { timeZone: TZ };
+  f = new Intl.DateTimeFormat(
+    "en-PH",
+    kind === "day"
+      ? { ...base, month: "short", day: "numeric" }
+      : {
+          ...base,
+          month: "short",
+          day: "numeric",
+          hour: "numeric",
+          minute: "2-digit",
+        },
+  );
+  dtfCache.set(kind, f);
+  return f;
+}
+
+/** "Jul 27" in Manila time — never toISOString(), which is 8h behind. */
+function shortDate(ts) {
+  const n = Number(ts);
+  if (!Number.isFinite(n)) return "";
+  try {
+    return dtf("day").format(new Date(n));
+  } catch {
+    return "";
+  }
+}
+
+function shortStamp(ts) {
+  const n = Number(ts);
+  if (!Number.isFinite(n)) return "";
+  try {
+    return dtf("stamp").format(new Date(n));
+  } catch {
+    return "";
+  }
+}
 
 /**
  * Escape a string for safe interpolation into HTML text/attribute content.
@@ -138,6 +182,8 @@ export function renderHome(vm) {
       <span class="vault-amt amt">${fmt(vm.vault.totalCent)}</span>
       <span class="vault-pct">${Math.round(vm.vault.pct)}%</span>
       <span class="vault-lock" aria-hidden="true">&#128274;</span>
+      <button class="vault-withdraw btn btn-ghost" type="button"
+        data-action="open-withdraw">Withdraw</button>
     </section>
 
     <section class="hero">
@@ -204,29 +250,272 @@ export function renderIncomeSheet(vm) {
   </div>`;
 }
 
-/** P4 stub — placeholder only, wired for navigation. */
-export function renderSettingsScreen() {
+/**
+ * Withdraw sheet — money leaving the vault.
+ *
+ * ACCESS WITH FRICTION, not a locked box. The vault is excluded from
+ * "safe to spend today" so the daily number stays honest, but real birthdays
+ * and gifts get paid out of it a few times a year. The friction is a REQUIRED
+ * reason, not a confirm dialog: the reason is the thing you read back in
+ * History six months later, and a confirm teaches nothing.
+ *
+ * The submit button ships disabled and main.js enables it on the note's
+ * input event (that listener only flips `disabled` — it never re-renders, so
+ * RULE 1 holds and the keyboard stays up).
+ *
+ * @param {{availableCent:number}} vm  from budget.maxWithdrawable()
+ * @returns {string}
+ */
+export function renderWithdrawSheet(vm) {
+  const availableCent = Number.isFinite(vm?.availableCent)
+    ? vm.availableCent
+    : 0;
+  return `<div class="sheet screen-withdraw" role="dialog" aria-modal="true" aria-label="Withdraw from vault">
+    <div class="sheet-backdrop" data-action="close-sheet"></div>
+    <div class="sheet-panel">
+      <h2 class="sheet-title">Withdraw from vault</h2>
+      <p class="withdraw-available">${fmt(availableCent)} available</p>
+      <input class="amount-input amt" type="text" inputmode="decimal" placeholder="₱0"
+        autocomplete="off" aria-label="Amount to withdraw">
+      <p class="amount-error" hidden></p>
+      <div class="withdraw-reason">
+        <label class="withdraw-reason-label" for="withdraw-note">What is this for?</label>
+        <input class="note-input" id="withdraw-note" type="text" required
+          placeholder="Required &mdash; e.g. Mom's birthday gift" aria-label="Reason">
+        <p class="withdraw-hint">A reason is required. It's the only record of why this money left.</p>
+      </div>
+      <button class="btn btn-primary" type="button" data-action="commit-withdraw"
+        disabled>Withdraw</button>
+    </div>
+  </div>`;
+}
+
+/* -------------------------------------------------------------------- */
+/* Settings                                                             */
+/* -------------------------------------------------------------------- */
+
+/**
+ * One editable percentage row. The input commits on change/blur only
+ * (RULE 2) — main.js reads every row's value when Save is tapped, so a
+ * half-typed field can never be written.
+ */
+function renderPctRow(cat) {
+  const vaultTag = cat.vault ? ` <span class="cat-row-tag">Vault</span>` : "";
+  return `<div class="cat-row" data-cat-id="${esc(cat.id)}">
+    <span class="cat-row-name">${esc(cat.name)}${vaultTag}</span>
+    <input class="cat-row-pct num" type="number" inputmode="decimal"
+      min="0" max="100" step="0.01" value="${esc(String(cat.pct))}"
+      data-cat-id="${esc(cat.id)}"
+      aria-label="${esc(cat.name)} percent">
+    <span class="cat-row-unit" aria-hidden="true">%</span>
+  </div>`;
+}
+
+/**
+ * The sync status block. ONE node, always present (even unconfigured), so
+ * patchSyncStatus can swap its innerHTML without ever restructuring the
+ * screen around a focused input.
+ */
+function syncStatusInner(status) {
+  const s = status || {};
+  const bits = [
+    s.configured
+      ? `<span class="sync-stat">Configured</span>`
+      : `<span class="sync-stat sync-stat--off">Not configured</span>`,
+    `<span class="sync-stat">${Number(s.pending) || 0} pending</span>`,
+    s.lastOkAt
+      ? `<span class="sync-stat">Last sync ${esc(shortStamp(s.lastOkAt))}</span>`
+      : `<span class="sync-stat">Never synced</span>`,
+  ];
+  if (s.syncing) bits.push(`<span class="sync-stat">Syncing&hellip;</span>`);
+  const err = s.lastErr
+    ? `<span class="sync-error">${esc(s.lastErr)}</span>`
+    : "";
+  return bits.join("") + err;
+}
+
+function renderSyncStatus(status) {
+  return `<div class="sync-status">${syncStatusInner(status)}</div>`;
+}
+
+/**
+ * Settings screen.
+ *
+ * The token input carries the secret. It is `type="password"`, it is never
+ * logged, and it is never interpolated anywhere except this one `value`
+ * attribute — nothing else on this screen may read it back out.
+ *
+ * @param {{categories:{id,name,pct,vault}[], totalPct:number,
+ *          syncUrl:string, token:string, status:object,
+ *          fallback:boolean, catError?:string, syncError?:string,
+ *          syncNotice?:string}} vm
+ * @returns {string}
+ */
+export function renderSettingsScreen(vm) {
+  const cats = Array.isArray(vm?.categories) ? vm.categories : [];
+  const total = Number.isFinite(vm?.totalPct) ? vm.totalPct : 0;
+  // Compared the way store.validateCategories compares, so the button state
+  // and the actual write agree exactly — 33.33+33.33+33.34 must read as 100.
+  const balanced = Math.round(total * 1e6) === 100 * 1e6;
+  const totalText = Number.isInteger(total) ? String(total) : total.toFixed(2);
+
+  const catError = vm?.catError
+    ? `<p class="settings-error">${esc(vm.catError)}</p>`
+    : "";
+  const backupError = vm?.backupError
+    ? `<p class="settings-error">${esc(vm.backupError)}</p>`
+    : "";
+  const syncError = vm?.syncError
+    ? `<p class="settings-error">${esc(vm.syncError)}</p>`
+    : "";
+  const syncNotice = vm?.syncNotice
+    ? `<p class="settings-notice">${esc(vm.syncNotice)}</p>`
+    : "";
+  const fallbackNote = vm?.fallback
+    ? `<p class="settings-note">Local-only storage &mdash; this browser refused IndexedDB, so transactions live in localStorage. Export a backup regularly.</p>`
+    : "";
+
   return `<div class="screen screen-settings">
     <header class="topbar">
       <button class="btn btn-ghost" type="button" data-action="go-home" aria-label="Back">&lsaquo;</button>
       <h1>Settings</h1>
     </header>
-    <div class="empty">
-      <p class="empty-title">Settings are coming in a later update.</p>
-    </div>
+
+    <section class="settings-section">
+      <h2 class="settings-title">Percentages</h2>
+      <div class="cat-rows">${cats.map(renderPctRow).join("")}</div>
+      <div class="cat-total ${balanced ? "cat-total--ok" : "cat-total--bad"}">
+        <span class="cat-total-label">Total</span>
+        <span class="cat-total-value num">${esc(totalText)}%</span>
+      </div>
+      ${catError}
+      <p class="settings-note">Changes apply to FUTURE months. This month's split was
+        snapshotted when you set its income and stays frozen on purpose.</p>
+      <button class="btn btn-primary" type="button" data-action="save-categories"
+        ${balanced ? "" : "disabled"}>Save percentages</button>
+    </section>
+
+    <section class="settings-section">
+      <h2 class="settings-title">Sync</h2>
+      <label class="field">
+        <span class="field-label">Apps Script /exec URL</span>
+        <input class="sync-url-input" type="url" inputmode="url" autocomplete="off"
+          autocapitalize="off" spellcheck="false"
+          placeholder="https://script.google.com/&hellip;/exec"
+          value="${esc(vm?.syncUrl ?? "")}">
+      </label>
+      <label class="field">
+        <span class="field-label">Token</span>
+        <input class="sync-token-input" type="password" autocomplete="off"
+          autocapitalize="off" spellcheck="false" placeholder="Shared secret"
+          value="${esc(vm?.token ?? "")}">
+      </label>
+      ${syncError}
+      ${syncNotice}
+      <div class="settings-actions">
+        <button class="btn btn-primary" type="button" data-action="save-sync">Save</button>
+        <button class="btn btn-ghost" type="button" data-action="test-sync">Test connection</button>
+      </div>
+      ${renderSyncStatus(vm?.status)}
+    </section>
+
+    <section class="settings-section">
+      <h2 class="settings-title">Backup</h2>
+      <div class="settings-actions">
+        <button class="btn btn-ghost" type="button" data-action="export-json">Export JSON</button>
+        <button class="btn btn-ghost" type="button" data-action="import-json">Import JSON</button>
+      </div>
+      <p class="settings-note">The export never contains your sync token.</p>
+      ${backupError}
+      <input class="import-file" type="file" accept="application/json,.json" hidden>
+      ${fallbackNote}
+    </section>
   </div>`;
 }
 
-/** P4 stub — placeholder only, wired for navigation. */
-export function renderHistoryScreen() {
-  return `<div class="screen screen-history">
-    <header class="topbar">
+/* -------------------------------------------------------------------- */
+/* History                                                              */
+/* -------------------------------------------------------------------- */
+
+/** Non-spend rows get a WORD, not just a colour — colour alone isn't a label. */
+function kindTag(kind) {
+  if (kind === "withdrawal")
+    return `<span class="txn-tag txn-tag--withdrawal">Withdrawal</span>`;
+  if (kind === "sweep")
+    return `<span class="txn-tag txn-tag--sweep">Swept</span>`;
+  if (kind === "income")
+    return `<span class="txn-tag txn-tag--income">Refund</span>`;
+  return "";
+}
+
+function renderTxnRow(t) {
+  const note = t.note ? ` &middot; ${esc(t.note)}` : "";
+  return `<li class="list-row txn-row txn-row--${esc(t.kind || "expense")}" data-id="${esc(t.id)}">
+    <span class="list-row-main">
+      <span class="txn-date">${esc(shortDate(t.ts))}</span>
+      <span class="txn-cat">${esc(t.categoryName || t.categoryId || "")}</span>
+      ${kindTag(t.kind)}
+      <span class="txn-note">${note}</span>
+    </span>
+    <span class="list-row-amt amt">${fmt(t.cent)}</span>
+    <button class="btn btn-danger txn-delete" type="button" data-action="delete-txn"
+      data-id="${esc(t.id)}" aria-label="Delete transaction">&times;</button>
+  </li>`;
+}
+
+function renderMonthRow(m, openKey) {
+  const open = m.key === openKey;
+  const swept =
+    m.closed && Number.isFinite(m.sweptCent)
+      ? `<span class="month-swept">${fmt(m.sweptCent)} swept</span>`
+      : "";
+  const state = m.closed
+    ? `<span class="month-state month-state--closed">Closed</span>`
+    : `<span class="month-state month-state--open">Open</span>`;
+  const body = open
+    ? (m.txns || []).length
+      ? `<ul class="list txn-list">${(m.txns || []).map(renderTxnRow).join("")}</ul>`
+      : `<p class="empty-title txn-empty">No transactions in ${esc(m.label)}.</p>`
+    : "";
+  return `<li class="month-item ${open ? "month-item--open" : ""}" data-id="${esc(m.key)}">
+    <button class="month-head list-row" type="button" data-action="toggle-month"
+      data-id="${esc(m.key)}" aria-expanded="${open ? "true" : "false"}">
+      <span class="list-row-main">
+        <span class="month-name">${esc(m.label)}</span>
+        ${state}
+        ${swept}
+      </span>
+      <span class="list-row-amt amt">${fmt(m.incomeCent)}</span>
+    </button>
+    ${body}
+  </li>`;
+}
+
+/**
+ * History screen — months newest-first, one expandable at a time.
+ * @param {{months:object[], openKey:string|null}} vm
+ * @returns {string}
+ */
+export function renderHistoryScreen(vm) {
+  const months = Array.isArray(vm?.months) ? vm.months : [];
+  const head = `<header class="topbar">
       <button class="btn btn-ghost" type="button" data-action="go-home" aria-label="Back">&lsaquo;</button>
       <h1>History</h1>
-    </header>
-    <div class="empty">
-      <p class="empty-title">Transaction history is coming in a later update.</p>
-    </div>
+    </header>`;
+
+  if (!months.length) {
+    return `<div class="screen screen-history">
+      ${head}
+      <div class="empty">
+        <p class="empty-title">Nothing here yet. Set an income and log an expense &mdash; months land here as they close.</p>
+      </div>
+    </div>`;
+  }
+
+  const rows = months.map((m) => renderMonthRow(m, vm?.openKey)).join("");
+  return `<div class="screen screen-history">
+    ${head}
+    <ul class="list month-list">${rows}</ul>
   </div>`;
 }
 
@@ -266,4 +555,95 @@ export function clearAmountError(panel) {
   if (!el) return;
   el.hidden = true;
   el.textContent = "";
+}
+
+/**
+ * Enable/disable the withdraw submit from the note's current contents.
+ *
+ * This is the whole friction mechanism, and it runs on every keystroke — so it
+ * must never touch anything but the button's `disabled` flag. Re-rendering the
+ * sheet here would drop the iOS keyboard on the first character typed
+ * (RULE 1), which is exactly the input we're watching.
+ *
+ * @param {Element} panel  the `.sheet-panel` currently in the DOM
+ * @returns {boolean} whether a reason is present
+ */
+export function syncWithdrawEnabled(panel) {
+  const note = panel?.querySelector(".note-input");
+  const btn = panel?.querySelector('[data-action="commit-withdraw"]');
+  const ok = !!note && note.value.trim().length > 0;
+  if (btn) btn.disabled = !ok;
+  return ok;
+}
+
+/**
+ * Show/clear the withdraw sheet's reason message in place.
+ * Separate from showAmountError so the message sits under the field it's
+ * actually about.
+ */
+export function showReasonError(panel, message) {
+  const el = panel?.querySelector(".withdraw-hint");
+  if (!el) return;
+  el.textContent =
+    message ||
+    "A reason is required. It's the only record of why this money left.";
+  el.classList.toggle("withdraw-hint--error", !!message);
+}
+
+/**
+ * Repaint the sync status block from a sync.status() snapshot.
+ * Driven by sync.onChange, which can fire while a percentage input is
+ * focused — so this replaces ONLY the status region, never the screen.
+ */
+export function patchSyncStatus(root, status) {
+  const host = root?.querySelector(".sync-status");
+  if (!host) return;
+  host.innerHTML = syncStatusInner(status);
+}
+
+/**
+ * Recompute the Settings percentage total in place and re-gate Save.
+ *
+ * Called on `input` for live feedback — but it only writes textContent, a
+ * class and a `disabled` flag on nodes that are NOT the focused field, so the
+ * caret survives. Nothing here commits: Save reads the rows itself (RULE 2).
+ *
+ * @param {Element} root  the `.screen-settings` element
+ * @returns {number} the current total
+ */
+export function patchPctTotal(root) {
+  const inputs = [...(root?.querySelectorAll(".cat-row-pct") ?? [])];
+  let scaled = 0;
+  for (const el of inputs) {
+    const n = Number(el.value);
+    scaled += Math.round((Number.isFinite(n) ? n : 0) * 1e6);
+  }
+  const total = scaled / 1e6;
+  const balanced = scaled === 100 * 1e6;
+
+  const value = root?.querySelector(".cat-total-value");
+  if (value) {
+    value.textContent = `${Number.isInteger(total) ? total : total.toFixed(2)}%`;
+  }
+  const box = root?.querySelector(".cat-total");
+  if (box) {
+    box.classList.toggle("cat-total--ok", balanced);
+    box.classList.toggle("cat-total--bad", !balanced);
+  }
+  const save = root?.querySelector('[data-action="save-categories"]');
+  if (save) save.disabled = !balanced;
+  return total;
+}
+
+/** Replace an inline settings error message without re-rendering the screen. */
+export function showSettingsError(section, message) {
+  if (!section) return;
+  let el = section.querySelector(".settings-error");
+  if (!el) {
+    el = document.createElement("p");
+    el.className = "settings-error";
+    section.appendChild(el);
+  }
+  el.textContent = message || "";
+  el.hidden = !message;
 }

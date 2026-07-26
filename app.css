@@ -756,4 +756,477 @@
     font-weight: 600;
     font-variant-numeric: lining-nums tabular-nums;
   }
+
+  /* ================================================================
+     PASS 2 — withdraw flow, settings, history.
+     Class names verified against js/render.js. Same language as above:
+     no new hex values, only new pairings of existing tokens (every pair
+     computed in both schemes — contrast notes inline). Only transform /
+     opacity ever animate.
+     ================================================================ */
+
+  /* Safety: several elements toggle the `hidden` attribute while carrying
+     a display-setting class (.note-row is flex). Author display beats the
+     UA's [hidden] rule, so hidden things would stay visible without this. */
+  [hidden] {
+    display: none !important;
+  }
+
+  /* ---------- shared: inline validation message ----------
+     Under the amount input in every sheet (add / income / withdraw).
+     over on --surface: 6.4:1 dark · 6.5:1 light. */
+  .amount-error {
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--over);
+    text-align: center;
+    padding-block: var(--s1);
+  }
+
+  /* ---------- shared: a deliberately disabled button ----------
+     Not a ghost of the enabled state — its own state: flat well, no
+     accent, no press feedback, but the label stays readable.
+     dim on --surface-2: 6.2:1 dark · 5.0:1 light. */
+  .btn[disabled] {
+    background: var(--surface-2);
+    color: var(--dim);
+    box-shadow: none;
+    cursor: default;
+  }
+  .btn[disabled]:active {
+    transform: none;
+    opacity: 1;
+  }
+
+  /* ---------- shared pill: worded state marks ----------
+     One geometry for every inline state word (month state, sweeps, txn
+     kinds, the Vault tag). The WORD is always the signal; hue and border
+     style only reinforce it. All sit on --bg:
+     dim 7.5:1 · 5.4:1 | vault 7.6:1 · 6.1:1 | safe 10.0:1 · 5.0:1. */
+  .cat-row-tag,
+  .month-state,
+  .month-swept,
+  .txn-tag {
+    flex: none;
+    display: inline-block;
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    padding: 1px var(--s2);
+    border-radius: 999px;
+    color: var(--dim);
+    border: 1px solid var(--border);
+    vertical-align: 0.1em;
+  }
+
+  /* ---------- vault card additions ---------- */
+  /* The lock glyph — decorative (aria-hidden), pinned to the card's top
+     right where the label row leaves empty space. */
+  .vault-lock {
+    position: absolute;
+    top: var(--s4);
+    right: var(--s4);
+    font-size: 12px;
+    line-height: 1;
+    opacity: 0.8;
+  }
+  /* Withdraw affordance: a quiet text action inside the card — clearly
+     present, vault-hued so it belongs here, small so it never competes
+     with the balance. Negative margins fold the 48px hit area into the
+     card's padding so the card doesn't grow a full tap-height.
+     vault on card tint (13% mix): 5.7:1 dark · 5.5:1 light. */
+  .vault-withdraw {
+    grid-column: 1 / -1;
+    justify-self: start;
+    display: inline-flex;
+    align-items: center;
+    min-height: var(--tap);
+    margin: calc(-1 * var(--s2)) 0 calc(-1 * var(--s3)) calc(-1 * var(--s2));
+    padding: 0 var(--s2);
+    border-radius: var(--r2);
+    font-size: 13px;
+    font-weight: 700;
+    color: var(--vault);
+  }
+  .vault-withdraw:active {
+    opacity: 0.65;
+  }
+
+  /* ---------- withdraw sheet ----------
+     Friction as consideration, not punishment: the sheet shifts to the
+     vault's blue (available line, reason ring, submit, caret) instead of
+     the everyday spend-green, so add-expense muscle memory doesn't carry
+     over; the balance is stated plainly up top; and the reason field is
+     a first-class gate, not an optional afterthought. */
+  .screen-withdraw .amount-input {
+    caret-color: var(--vault);
+  }
+
+  /* Available balance — the vault card's language, condensed to one line.
+     text on tint: 13.1:1 dark · 13.5:1 light. */
+  .withdraw-available {
+    display: flex;
+    align-items: center;
+    min-height: var(--tap);
+    padding: 0 var(--s4);
+    border-radius: var(--r3);
+    background: color-mix(in srgb, var(--vault) 13%, var(--surface));
+    border: 1px solid color-mix(in srgb, var(--vault) 28%, var(--border));
+    font-size: 15px;
+    font-weight: 600;
+    font-variant-numeric: lining-nums tabular-nums;
+  }
+
+  /* The reason gate. Weightier than the optional expense note: a real
+     label, a vault-ringed well, and a standing explanation underneath. */
+  .withdraw-reason {
+    display: flex;
+    flex-direction: column;
+    gap: var(--s2);
+    margin-top: var(--s3);
+  }
+  .withdraw-reason-label {
+    font-size: 14px;
+    font-weight: 600;
+  }
+  .screen-withdraw .note-input {
+    width: 100%;
+    box-shadow: inset 0 0 0 1px
+      color-mix(in srgb, var(--vault) 30%, var(--border));
+  }
+  /* The hint is always present — the rule is stated before it's broken.
+     faint on --surface: 5.6:1 dark · 5.1:1 light. On failed submit the
+     text changes AND gains weight; colour only reinforces (over on
+     --surface: 6.4:1 · 6.5:1). */
+  .withdraw-hint {
+    font-size: 13px;
+    color: var(--faint);
+  }
+  .withdraw-hint--error {
+    color: var(--over);
+    font-weight: 600;
+  }
+
+  /* Submit: full-width, vault-blue — a different signature from every
+     green spend action. ink on vault: 7.6:1 dark · 6.7:1 light. Ships
+     disabled; the [disabled] override below must win over this rule, so
+     it repeats the attribute at higher specificity. */
+  .screen-withdraw .btn-primary {
+    width: 100%;
+    margin-top: var(--s4);
+    background: var(--vault);
+    color: var(--safe-ink);
+  }
+  .screen-withdraw .btn-primary[disabled] {
+    background: var(--surface-2);
+    color: var(--dim);
+  }
+
+  /* ---------- settings ----------
+     Hairlines and rhythm, not boxes — sections separate by space. */
+  .settings-section {
+    display: flex;
+    flex-direction: column;
+    gap: var(--s2);
+  }
+  .settings-section + .settings-section {
+    margin-top: var(--s2);
+    padding-top: var(--s4);
+    border-top: 1px solid color-mix(in srgb, var(--border) 55%, transparent);
+  }
+  .settings-title {
+    font-size: 12px;
+    font-weight: 600;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--faint); /* on --bg: 6.1:1 dark · 4.6:1 light */
+  }
+  /* Explanatory copy / inline messages. Words carry the state; the error
+     and notice hues only reinforce. over on --bg: 7.0:1 · 5.9:1;
+     safe on --bg: 10.0:1 · 5.0:1. */
+  .settings-note {
+    font-size: 13px;
+    line-height: 1.45;
+    color: var(--faint);
+  }
+  .settings-error {
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--over);
+  }
+  .settings-notice {
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--safe);
+  }
+  .settings-actions {
+    display: flex;
+    gap: var(--s2);
+  }
+  .settings-actions .btn {
+    flex: 1;
+  }
+
+  /* Percentage editor. One row per category: name left, a fixed-width
+     right-aligned input well + unit right — every well identical, so the
+     column of numbers reads as one aligned instrument. */
+  .cat-rows {
+    display: flex;
+    flex-direction: column;
+  }
+  .cat-row {
+    display: flex;
+    align-items: center;
+    gap: var(--s2);
+    min-height: var(--tap);
+    font-size: 15px;
+    font-weight: 600;
+  }
+  .cat-row-name {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .cat-row-tag {
+    color: var(--vault);
+    border-color: color-mix(in srgb, var(--vault) 45%, var(--border));
+    margin-left: var(--s1);
+  }
+  .cat-row-pct {
+    flex: none;
+    width: 5em;
+    min-height: var(--tap);
+    padding: 0 var(--s3);
+    text-align: right;
+    background: var(--surface-2);
+    border-radius: var(--r2);
+  }
+  .cat-row-pct::-webkit-outer-spin-button,
+  .cat-row-pct::-webkit-inner-spin-button {
+    -webkit-appearance: none;
+    margin: 0;
+  }
+  .cat-row-unit {
+    flex: none;
+    width: 1.2em;
+    font-size: 13px;
+    color: var(--faint);
+  }
+
+  /* The 100% gate. A totals row under the column, value aligned with the
+     input wells. State is never colour alone: balanced appends a check,
+     unbalanced appends "!", and the number itself shows the arithmetic.
+     A disabled Save (rule above) completes the same statement. */
+  .cat-total {
+    display: flex;
+    align-items: center;
+    gap: var(--s2);
+    min-height: var(--tap);
+    border-top: 1px solid var(--border);
+    font-size: 15px;
+    font-weight: 700;
+  }
+  .cat-total-label {
+    flex: none;
+  }
+  .cat-total-value {
+    margin-left: auto;
+    padding-right: var(--s3); /* mirrors the wells' inner padding */
+  }
+  .cat-total::after {
+    flex: none;
+    width: 1.2em;
+    font-size: 13px;
+  }
+  .cat-total--ok {
+    color: var(--safe); /* on --bg: 10.0:1 dark · 5.0:1 light */
+  }
+  .cat-total--ok::after {
+    content: "\2713"; /* ✓ */
+  }
+  .cat-total--bad {
+    color: var(--over); /* on --bg: 7.0:1 dark · 5.9:1 light */
+  }
+  .cat-total--bad::after {
+    content: "!";
+  }
+
+  /* Sync form fields: the note-input well language, labelled. */
+  .field {
+    display: flex;
+    flex-direction: column;
+    gap: var(--s1);
+  }
+  .field-label {
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--dim); /* on --bg: 7.5:1 dark · 5.4:1 light */
+  }
+  .field > input {
+    width: 100%;
+    min-height: var(--tap);
+    padding: 0 var(--s4);
+    background: var(--surface-2);
+    border-radius: var(--r3);
+  }
+  .field > input::placeholder {
+    color: var(--faint);
+  }
+
+  /* Sync status: quiet when healthy, legible when not. Plain dim facts
+     ("Configured · 0 pending · Last sync …"); the off state warms to
+     caution (word carries it — caution on --bg: 11.5:1 · 4.8:1) and an
+     error breaks onto its own line in over + weight. */
+  .sync-status {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    column-gap: var(--s3);
+    row-gap: var(--s1);
+    min-height: 32px;
+    font-size: 13px;
+    color: var(--dim);
+  }
+  .sync-stat {
+    flex: none;
+  }
+  .sync-stat--off {
+    color: var(--caution);
+    font-weight: 600;
+  }
+  .sync-error {
+    flex-basis: 100%;
+    font-weight: 600;
+    color: var(--over); /* on --bg: 7.0:1 dark · 5.9:1 light */
+    overflow-wrap: anywhere;
+  }
+
+  /* ---------- history ----------
+     Months are disclosure rows: chevron, name, state word, income right.
+     Chevron rotation is transform-only. */
+  .month-item {
+    animation: fade-in var(--t-small) var(--ease) backwards;
+  }
+  .month-head {
+    width: 100%;
+    justify-content: flex-start;
+    text-align: left;
+    font-size: 15px;
+    cursor: pointer;
+  }
+  .month-head::before {
+    content: "\203A"; /* › */
+    flex: none;
+    width: 1em;
+    text-align: center;
+    color: var(--faint);
+    transform: rotate(0deg);
+    transition: transform var(--t-small) var(--ease);
+  }
+  .month-item--open .month-head::before {
+    transform: rotate(90deg);
+  }
+  .month-head .list-row-main {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    align-items: center;
+    gap: var(--s2);
+  }
+  .month-name {
+    flex: none;
+    font-weight: 600;
+  }
+  .month-state--open {
+    color: var(--safe);
+    border-color: color-mix(in srgb, var(--safe) 45%, var(--border));
+  }
+  /* closed months keep the quiet dim pill from the shared base */
+  .month-swept {
+    color: var(--vault);
+    border-color: color-mix(in srgb, var(--vault) 45%, var(--border));
+  }
+
+  /* Transactions. Indented one chevron-width so they nest under the month
+     name. The row's inner .list-row-main becomes a flex track: date and
+     category are fixed, the note absorbs and ellipsizes all overflow —
+     the ₱ column (flex:none on .list-row-amt) can never be pushed. */
+  .txn-list {
+    list-style: none;
+    padding-left: calc(1em + var(--s2));
+    display: flex;
+    flex-direction: column;
+    animation: fade-in var(--t-small) var(--ease) backwards;
+  }
+  .txn-row .list-row-main {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    align-items: center;
+    gap: var(--s2);
+  }
+  .txn-date {
+    flex: none;
+    width: 2.2em;
+    font-size: 12px;
+    color: var(--faint); /* on --bg: 6.1:1 dark · 4.6:1 light */
+    font-variant-numeric: lining-nums tabular-nums;
+  }
+  .txn-cat {
+    flex: none;
+    max-width: 40%;
+    font-size: 14px;
+    font-weight: 600;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .txn-note {
+    flex: 1 1 auto;
+    min-width: 0;
+    font-size: 13px;
+    color: var(--dim);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  /* Kind marks. Ordinary spends carry no pill; the others get a worded
+     one — the WORD distinguishes them, and the border style (withdrawal
+     solid vs sweep dashed) is a second colour-free cue for anyone who
+     can't split the hues. */
+  .txn-tag--withdrawal {
+    color: var(--vault);
+    border-color: color-mix(in srgb, var(--vault) 45%, var(--border));
+  }
+  .txn-tag--sweep {
+    border-style: dashed;
+    border-color: color-mix(in srgb, var(--dim) 45%, var(--border));
+  }
+  .txn-tag--income {
+    color: var(--safe);
+    border-color: color-mix(in srgb, var(--safe) 45%, var(--border));
+  }
+
+  /* Per-row delete: quiet glyph, full tap square. Overrides .btn-danger's
+     loud red — an always-visible red × on every row shouts; the aria-label
+     and position carry the meaning. */
+  .txn-delete {
+    flex: none;
+    min-width: var(--tap);
+    padding: 0;
+    font-size: 18px;
+    color: var(--faint);
+    margin-right: calc(-1 * var(--s2));
+  }
+
+  .txn-empty {
+    font-size: 14px;
+    max-width: none;
+    padding-block: var(--s3);
+    padding-left: calc(1em + var(--s2));
+  }
 }
