@@ -394,12 +394,17 @@ function bindListeners() {
   if (listenersBound) return;
   listenersBound = true;
   try {
+    // Deliberately NOT force:true. A flapping connection fires `online`
+    // repeatedly and a user tabbing in and out fires `visibilitychange`
+    // repeatedly; forcing on either would reset the backoff every time and
+    // turn a failing server into a retry storm. Only an explicit "Sync now"
+    // tap should force.
     if (typeof globalThis.addEventListener === "function") {
-      globalThis.addEventListener("online", () => kick({ force: true }));
+      globalThis.addEventListener("online", () => kick());
     }
     if (typeof document !== "undefined" && document?.addEventListener) {
       document.addEventListener("visibilitychange", () => {
-        if (document.visibilityState === "visible") kick({ force: true });
+        if (document.visibilityState === "visible") kick();
       });
     }
   } catch {
@@ -515,7 +520,7 @@ export function onChange(cb) {
  * it can never write a row. Never throws.
  * @returns {Promise<{ok:true}|{ok:false, error:string}>}
  */
-export async function test() {
+export async function testConnection() {
   if (!configured()) return { ok: false, error: "Not configured" };
   const res = await postBatch([]);
   if (res.ok) {
