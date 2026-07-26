@@ -406,26 +406,239 @@ test("envelopePaceTick: 0..1, past months full, future months empty", () => {
 
 // ---- sweep -----------------------------------------------------------------
 
-test("computeSweep: non-vault leftovers only; overspend contributes 0", () => {
+test("computeSweep: non-vault leftovers only, no envelope goes negative", () => {
   const m = july();
   const txns = [
-    tx("2026-07", "food", 700000), // 50,000 left
-    tx("2026-07", "gas", 300000), // over by 75,000
+    tx("2026-07", "food", 500000), // 250,000 left
+    tx("2026-07", "gas", 100000), // 125,000 left
     tx("2026-07", "save", 100000), // vault — irrelevant
   ];
   const sweep = computeSweep(m, txns);
-  assert.equal(sweep.byCat.food, 50000);
-  assert.equal(
-    sweep.byCat.gas,
-    undefined,
-    "an overspent envelope must not go negative",
-  );
+  // Nothing is overspent, so the pool cap does not bind and every envelope
+  // sweeps its own leftover untouched.
+  assert.equal(sweep.byCat.food, 250000);
+  assert.equal(sweep.byCat.gas, 125000);
   assert.equal(sweep.byCat.coffee, 200000);
   assert.equal(sweep.byCat.buffer, 125000);
   assert.equal(sweep.byCat.misc, 75000);
-  assert.equal(sweep.fromCent, 50000 + 200000 + 125000 + 75000);
+  assert.equal(sweep.fromCent, 250000 + 125000 + 200000 + 125000 + 75000);
+  assert.equal(sweep.fromCent, spendablePool(m, txns).leftCent);
   assert.equal(sweep.toVaultCent, sweep.fromCent);
   assert.ok(!("save" in sweep.byCat));
+});
+
+test("computeSweep: an overspent envelope cannot invent money in the vault", () => {
+  // THE BUG. Flooring each envelope at 0 is right per-envelope but the SUM of
+  // the floored leftovers exceeds what the pool actually holds once anything
+  // is overspent — and the difference is real, withdrawable money that was
+  // already spent.
+  const m = july();
+  const txns = [
+    tx("2026-07", "food", 700000), // 50,000 left
+    tx("2026-07", "gas", 300000), // over by 75,000 — floors to 0
+    tx("2026-07", "save", 100000), // vault — irrelevant
+  ];
+  const pool = spendablePool(m, txns);
+  const sweep = computeSweep(m, txns);
+
+  assert.equal(pool.leftCent, 375000);
+  assert.equal(
+    sweep.fromCent,
+    375000,
+    "the sweep must not exceed what the pool actually has left",
+  );
+  // The naive sum of floored leftovers, which is what used to be swept.
+  assert.notEqual(sweep.fromCent, 50000 + 200000 + 125000 + 75000);
+  assert.ok(!("gas" in sweep.byCat), "an overspent envelope contributes 0");
+  assert.ok(!("save" in sweep.byCat), "the vault never sweeps into itself");
+
+  // byCat is scaled proportionally so it sums to fromCent EXACTLY — a
+  // breakdown that totals more than the money that moved is the same lie in a
+  // smaller font.
+  const parts = Object.values(sweep.byCat);
+  assert.equal(
+    parts.reduce((s, n) => s + n, 0),
+    sweep.fromCent,
+  );
+  // Order is preserved: bigger raw leftovers still get bigger shares.
+  assert.ok(sweep.byCat.coffee > sweep.byCat.buffer);
+  assert.ok(sweep.byCat.buffer > sweep.byCat.misc);
+  assert.ok(sweep.byCat.misc > sweep.byCat.food);
+});
+
+test("computeSweep: spend against a deleted category cannot inflate the sweep", () => {
+  // A "ghost" spend — the category was removed from Settings after the money
+  // went out. spendablePool counts it (the money left the account regardless)
+  // but it appears in no envelope, so the naive per-envelope sum misses it.
+  const m = july();
+  const txns = [tx("2026-07", "food", 700000), tx("2026-07", "gone", 500000)];
+  const pool = spendablePool(m, txns);
+  const sweep = computeSweep(m, txns);
+
+  assert.equal(pool.leftCent, 175000);
+  assert.equal(sweep.fromCent, 175000);
+  assert.ok(!("gone" in sweep.byCat), "a ghost category is not an envelope");
+  assert.equal(
+    Object.values(sweep.byCat).reduce((s, n) => s + n, 0),
+    sweep.fromCent,
+  );
+});
+
+test("computeSweep: a month spent past its whole pool sweeps nothing", () => {
+  const m = july();
+  const txns = [
+    tx("2026-07", "food", 2000000), // blows past the entire spendable pool
+    tx("2026-07", "coffee", 10000),
+  ];
+  assert.ok(spendablePool(m, txns).leftCent < 0);
+  const sweep = computeSweep(m, txns);
+  assert.equal(sweep.fromCent, 0, "never negative, never a consolation prize");
+  assert.equal(sweep.toVaultCent, 0);
+  assert.deepEqual(sweep.byCat, {});
+});
+
+// ---- THE INVARIANT ---------------------------------------------------------
+
+test("INVARIANT: a sweep can never move more than the pool has left (fuzz)", () => {
+  // The suite passed while this was broken because computeSweep and
+  // spendablePool were only ever tested in isolation. This is the relation
+  // between them, and it is the one that guards real money: anything swept
+  // above pool.left is invented, lands in the vault, and is withdrawable.
+  let s = 12345;
+  const rand = (n) => {
+    // xorshift — deterministic, so a failure is reproducible.
+    s ^= s << 13;
+    s ^= s >>> 17;
+    s ^= s << 5;
+    s >>>= 0;
+    return s % n;
+  };
+
+  const incomes = [0, 1, 100, 250000, 2500000, 99999999];
+  const ghosts = ["gone", "deleted-cat", "", "undefined"];
+
+  for (let round = 0; round < 800; round++) {
+    const income = incomes[rand(incomes.length)];
+    const m = newMonthFromSettings(
+      SETTINGS,
+      "2026-07",
+      income,
+      manila(2026, 7, 1, 0).getTime(),
+    );
+    const txns = [];
+    const nTx = rand(9);
+    for (let i = 0; i < nTx; i++) {
+      const roll = rand(10);
+      const cat =
+        roll === 0
+          ? ghosts[rand(ghosts.length)] // ghost / deleted category
+          : roll === 1
+            ? "save" // vault spend
+            : CATS[rand(CATS.length)].id;
+      // Amounts that comfortably straddle each envelope's allocation, so
+      // overspend is common rather than rare.
+      const cent = rand(1500000);
+      const kind =
+        roll === 2 ? "income" : roll === 3 ? "withdrawal" : "expense";
+      txns.push(tx("2026-07", cat, cent, { kind }));
+    }
+
+    const pool = spendablePool(m, txns);
+    const sweep = computeSweep(m, txns);
+    const cap = Math.max(0, pool.leftCent);
+
+    assert.ok(
+      sweep.fromCent <= cap,
+      `round ${round}: swept ${sweep.fromCent} > pool left ${cap}`,
+    );
+    assert.ok(sweep.fromCent >= 0, `round ${round}: negative sweep`);
+    assert.equal(sweep.toVaultCent, sweep.fromCent);
+
+    const parts = Object.values(sweep.byCat).reduce((a, b) => a + b, 0);
+    assert.ok(
+      parts <= sweep.fromCent,
+      `round ${round}: byCat sums to ${parts} > fromCent ${sweep.fromCent}`,
+    );
+    for (const v of Object.values(sweep.byCat)) {
+      assert.ok(v > 0, `round ${round}: a non-positive byCat entry`);
+    }
+    assert.ok(!("save" in sweep.byCat), `round ${round}: vault swept itself`);
+  }
+});
+
+test("INVARIANT: after close, the vault holds alloc + real leftovers − withdrawals", () => {
+  // Vault conservation across a close: the balance may equal what genuinely
+  // arrived, and never a centavo more. With Food overspent, the ₱5,000 hole
+  // used to reappear in the vault as spendable money.
+  const m = july();
+  const txns = [
+    tx("2026-07", "food", 1000000), // 250,000 over its 750,000
+    tx("2026-07", "coffee", 50000),
+  ];
+  const pool = spendablePool(m, txns);
+  const sweep = computeSweep(m, txns);
+
+  // Close the way store.closeMonth does.
+  m.closedAt = Date.now();
+  m.sweep = {
+    doneAt: Date.now(),
+    fromCent: sweep.fromCent,
+    byCat: sweep.byCat,
+  };
+
+  const vaultAlloc = m.alloc
+    .filter((a) => a.vault)
+    .reduce((s, a) => s + a.allocCent, 0);
+  const expected = vaultAlloc + Math.max(0, pool.leftCent);
+
+  assert.equal(vaultBalance([m], txns).balanceCent, expected);
+  assert.equal(maxWithdrawable([m], txns), expected);
+
+  // A withdrawal comes straight off it, and never below zero.
+  const w = [...txns, withdraw("2026-07", 300000)];
+  assert.equal(vaultBalance([m], w).balanceCent, expected - 300000);
+  assert.equal(
+    vaultBalance([m], [...txns, withdraw("2026-07", expected * 5)]).balanceCent,
+    0,
+  );
+
+  // And the money that was overspent is NOT in there.
+  const naive = m.alloc
+    .filter((a) => !a.vault)
+    .reduce((s, a) => {
+      const spent = a.id === "food" ? 1000000 : a.id === "coffee" ? 50000 : 0;
+      return s + Math.max(0, a.allocCent - spent);
+    }, 0);
+  assert.ok(naive > Math.max(0, pool.leftCent));
+  assert.notEqual(vaultBalance([m], txns).balanceCent, vaultAlloc + naive);
+});
+
+test("INVARIANT: sweeping many months never banks more than each pool held", () => {
+  const keys = ["2026-01", "2026-02", "2026-03", "2026-04", "2026-05"];
+  const months = [];
+  const all = [];
+  let expected = 0;
+
+  keys.forEach((k, i) => {
+    const m = newMonthFromSettings(SETTINGS, k, INCOME, 0);
+    // Month 2 and 4 are overspent; the rest are normal.
+    const txns =
+      i % 2 === 1
+        ? [tx(k, "food", 900000), tx(k, "gas", 100000)]
+        : [tx(k, "food", 300000)];
+    const pool = spendablePool(m, txns);
+    const sweep = computeSweep(m, txns);
+    assert.ok(sweep.fromCent <= Math.max(0, pool.leftCent), `${k} over-swept`);
+    m.closedAt = 1;
+    m.sweep = { doneAt: 1, fromCent: sweep.fromCent, byCat: sweep.byCat };
+    expected +=
+      m.alloc.filter((a) => a.vault).reduce((s, a) => s + a.allocCent, 0) +
+      Math.max(0, pool.leftCent);
+    months.push(m);
+    all.push(...txns);
+  });
+
+  assert.equal(vaultBalance(months, all).balanceCent, expected);
 });
 
 test("computeSweep is idempotent on a closed month", () => {

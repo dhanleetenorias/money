@@ -20,8 +20,13 @@ delete globalThis.indexedDB;
 
 const store = await import("../js/store.js");
 const idb = await import("../js/idb.js");
-const { newMonthFromSettings, computeSweep, monthsToClose, vaultBalance } =
-  await import("../js/budget.js");
+const {
+  newMonthFromSettings,
+  computeSweep,
+  monthsToClose,
+  vaultBalance,
+  maxWithdrawable,
+} = await import("../js/budget.js");
 
 const INCOME = 2500000;
 const manila = (y, m, d, hh = 12) =>
@@ -384,4 +389,183 @@ test("F2 an explicit expectation map overrides the tracked seq", async () => {
   const now = await idb.getOutbox();
   await idb.clearOutbox(["e1"], { e1: now[0].seq });
   assert.deepEqual(await idb.getOutbox(), []);
+});
+
+/* ------------------------------------------------------------------ *
+ * Reopen-and-edit income (main.js saveIncome)
+ *
+ * saveIncome itself needs a DOM (it reads an input and calls confirm), so
+ * these tests exercise the STORE SEQUENCE it performs rather than the handler.
+ * That is where the bug actually lived: the handler set a local `reopening`
+ * flag and went straight to upsertMonth, which by design refuses every write
+ * to a closed month and returns the stored record — so the user confirmed,
+ * typed a new income, the sheet closed, and nothing changed.
+ * ------------------------------------------------------------------ */
+
+test("R1 upserting a closed month WITHOUT reopening is a silent no-op", () => {
+  // The reported bug, pinned so it cannot come back.
+  const m = freshMonth("2026-06");
+  store.upsertMonth(m);
+  store.closeMonth("2026-06", computeSweep(m, []));
+
+  const edited = freshMonth("2026-06", 5000000);
+  const returned = store.upsertMonth(edited);
+
+  assert.equal(store.getMonth("2026-06").incomeCent, INCOME, "income moved");
+  assert.equal(returned.incomeCent, INCOME, "upsert returned the new record");
+  assert.ok(store.getMonth("2026-06").closedAt, "month silently stayed closed");
+});
+
+test("R2 reopenMonth THEN upsert is what actually edits a closed month", () => {
+  const m = freshMonth("2026-06");
+  store.upsertMonth(m);
+  store.closeMonth("2026-06", computeSweep(m, []));
+
+  const res = store.reopenMonth("2026-06");
+  assert.equal(res.ok, true);
+  assert.equal(store.getMonth("2026-06").closedAt, null);
+  assert.equal(store.getMonth("2026-06").sweep, null, "old sweep not cleared");
+
+  store.upsertMonth(freshMonth("2026-06", 5000000));
+  assert.equal(store.getMonth("2026-06").incomeCent, 5000000);
+});
+
+test("R3 reopening REVERSES the original sweep — the vault must not bank it twice", () => {
+  // reopenMonth puts the month back in the close queue. If the first sweep
+  // were still on the record (or its money still in the vault) the re-close
+  // would deposit the same leftovers a second time.
+  const m = freshMonth("2026-06");
+  store.upsertMonth(m);
+  const txns = [
+    {
+      id: "x1",
+      monthKey: "2026-06",
+      ts: 0,
+      cent: 300000,
+      categoryId: "food",
+      kind: "expense",
+      deleted: 0,
+    },
+  ];
+  const first = computeSweep(store.getMonth("2026-06"), txns);
+  store.closeMonth("2026-06", first);
+
+  const vaultAlloc = m.alloc
+    .filter((a) => a.vault)
+    .reduce((s, a) => s + a.allocCent, 0);
+  const closedBalance = vaultBalance(store.getMonths(), txns).balanceCent;
+  assert.equal(closedBalance, vaultAlloc + first.fromCent);
+
+  // Reopen: the swept money leaves the vault again immediately.
+  store.reopenMonth("2026-06");
+  assert.equal(
+    vaultBalance(store.getMonths(), txns).balanceCent,
+    vaultAlloc,
+    "the reopened month still banks its old sweep",
+  );
+
+  // Re-close on the SAME numbers: back to exactly one sweep, never two.
+  const second = computeSweep(store.getMonth("2026-06"), txns);
+  store.closeMonth("2026-06", second);
+  assert.equal(second.fromCent, first.fromCent);
+  assert.equal(
+    vaultBalance(store.getMonths(), txns).balanceCent,
+    closedBalance,
+    "re-closing banked the leftovers twice",
+  );
+
+  // And it is back in the close queue between the two, as reopenMonth promises.
+  assert.deepEqual(monthsToClose({ "2026-06": { key: "2026-06" } }, null), [
+    "2026-06",
+  ]);
+});
+
+test("R4 the sweep TXN row must be reversed on reopen, or the sheet double-counts", async () => {
+  // budget.js ignores kind:'sweep' rows, so leaving one behind changes no
+  // local number — but it is a real row in the Google Sheet, and the re-close
+  // appends a SECOND one with a fresh uid (a fresh idempotency key the server
+  // cannot dedupe). main.js reverses it via undoTxn; this pins the mechanics.
+  const sweepRow = {
+    id: "sweep-1",
+    monthKey: "2026-06",
+    ts: 1,
+    cent: 1075000,
+    categoryId: "save",
+    note: "Month close sweep",
+    kind: "sweep",
+    synced: 0,
+    deleted: 0,
+  };
+  await idb.addTxn(sweepRow);
+  assert.equal((await idb.getTxns("2026-06")).length, 1);
+
+  // Unsynced -> hard delete, and the outbox op goes with it.
+  await idb.deleteTxn("sweep-1");
+  const after = await idb.getTxns("2026-06");
+  assert.equal(after.length, 0, "the sweep row survived reopen");
+
+  // A SYNCED row must be voided instead, so the server gets a tombstone.
+  await idb.addTxn({ ...sweepRow, id: "sweep-2", synced: 1 });
+  await idb.voidTxn("sweep-2");
+  assert.equal((await idb.getTxns("2026-06")).length, 0);
+  const out = await idb.getOutbox();
+  const op = out.find((r) => r.id === "sweep-2");
+  assert.ok(op, "voiding a synced sweep row enqueued nothing");
+  assert.equal(
+    op.op,
+    "void",
+    "voiding a synced sweep row must enqueue a compensating op",
+  );
+  assert.equal(op.txn.deleted, 1, "the compensating op is not a tombstone");
+});
+
+/* ------------------------------------------------------------------ *
+ * The vault card and the withdraw sheet must quote ONE number
+ * ------------------------------------------------------------------ */
+
+test("R5 the home vault card reads the CUMULATIVE balance, not one month", () => {
+  // The card used to render vaultState().totalCent — this month's own
+  // contribution, floored at 0 — while the withdraw sheet correctly quoted the
+  // cumulative maxWithdrawable. With months banked, a legal withdrawal drove
+  // the card to ₱0 while most of the balance was still there and spendable.
+  const keys = [
+    "2026-02",
+    "2026-03",
+    "2026-04",
+    "2026-05",
+    "2026-06",
+    "2026-07",
+  ];
+  for (const k of keys) {
+    const m = freshMonth(k, INCOME);
+    store.upsertMonth(m);
+  }
+  const vaultPerMonth = 1125000; // 45% of ₱25,000
+  const expected = vaultPerMonth * keys.length;
+  assert.equal(vaultBalance(store.getMonths(), []).balanceCent, expected);
+
+  const w = [
+    {
+      id: "w1",
+      monthKey: "2026-07",
+      ts: 0,
+      cent: 5000000, // ₱50,000 — larger than any single month's 45%
+      categoryId: "save",
+      note: "gift",
+      kind: "withdrawal",
+      deleted: 0,
+    },
+  ];
+
+  // What the card used to show: this month alone, floored at 0.
+  const perMonthFloored = Math.max(0, vaultPerMonth - 5000000);
+  assert.equal(perMonthFloored, 0, "the old card would read ₱0");
+
+  // What both surfaces now show.
+  const balance = vaultBalance(store.getMonths(), w, "2026-07").balanceCent;
+  assert.equal(balance, expected - 5000000);
+  assert.ok(balance > 0, "money is still there and still withdrawable");
+
+  // THE INVARIANT: card and sheet are the same call, so they cannot disagree.
+  assert.equal(balance, maxWithdrawable(store.getMonths(), w, "2026-07"));
 });

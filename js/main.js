@@ -22,7 +22,7 @@ import * as sync from "./sync.js";
 import { fmt, parseAmount, uid, ym } from "./money.js";
 import * as R from "./render.js";
 import { initToast, showToast } from "./toast.js";
-import { registerSW } from "./sw-register.js";
+import { registerSW, checkForUpdate } from "./sw-register.js";
 
 const app = document.getElementById("app");
 
@@ -60,6 +60,56 @@ const ui = {
 };
 
 /* ------------------------------------------------------------------ *
+ * Re-entrancy guard for money-writing handlers
+ * ------------------------------------------------------------------ */
+
+/** Action names currently mid-commit. See guarded(). */
+const inFlight = new Set();
+
+/**
+ * Run a commit handler at most once at a time.
+ *
+ * INVARIANT: no handler that writes a transaction or a month may run twice
+ * concurrently. Every commit path awaits IDB before it writes (a balance read,
+ * a category lookup), and two taps inside that window both read the PRE-write
+ * state and both pass the cap — ₱45,000 withdrawn twice against a ₱45,000
+ * vault, with the balance display floored back to ₱0 so nothing looks wrong.
+ *
+ * Two layers, because either alone has a hole: the `disabled` flag stops the
+ * taps the browser would deliver, and the in-flight set stops anything the DOM
+ * can't (a synthetic click, a key repeat, a button that isn't there).
+ *
+ * Every button carrying `name` is disabled, not just the one tapped — the add
+ * sheet has one chip per category, and a second tap on a DIFFERENT chip books
+ * exactly the same double expense.
+ *
+ * @param {string} name the data-action value
+ * @param {() => Promise<void>|void} fn
+ */
+async function guarded(name, fn) {
+  if (inFlight.has(name)) return;
+  inFlight.add(name);
+  const btns = [...app.querySelectorAll(`[data-action="${name}"]`)];
+  const wasDisabled = btns.map((b) => !!b.disabled);
+  for (const b of btns) b.disabled = true;
+  try {
+    await fn();
+  } finally {
+    inFlight.delete(name);
+    // Only restore nodes still in the document: a successful commit closes the
+    // sheet and re-renders, so these are usually detached by now.
+    btns.forEach((b, i) => {
+      if (b.isConnected) b.disabled = wasDisabled[i];
+    });
+    // The withdraw button's enabled state is owned by the reason field, not by
+    // us — re-derive it rather than assume. No-op unless that sheet is open.
+    if (ui.sheet === "withdraw") {
+      R.syncWithdrawEnabled(app.querySelector(".sheet-panel"));
+    }
+  }
+}
+
+/* ------------------------------------------------------------------ *
  * Month helpers
  * ------------------------------------------------------------------ */
 
@@ -81,12 +131,27 @@ async function homeVM() {
   }
   const txns = await idb.getTxns(key);
   const now = Date.now();
+  // The card must quote the CUMULATIVE balance, from the same function the
+  // withdraw sheet's ceiling comes from (withdrawableCent -> maxWithdrawable
+  // -> vaultBalance). vaultState().totalCent is this month's contribution,
+  // floored at 0: with six months banked, a legal ₱50,000 withdrawal drove the
+  // card to ₱0 while ₱595,000 was still there and still withdrawable.
+  // INVARIANT: the card and the withdraw sheet read one number, so they cannot
+  // disagree. `vault` keeps vaultState's shape (pct comes from the snapshot)
+  // with only the displayed total swapped for the real balance.
+  const perMonth = B.vaultState(month, txns);
+  const allTxns = await idb.getAllTxns();
+  const balanceCent = B.vaultBalance(
+    store.getMonths(),
+    allTxns,
+    key,
+  ).balanceCent;
   return {
     hasIncome: true,
     monthLabel: label,
     incomeCent: month.incomeCent,
     vaultLabel: "Vault",
-    vault: B.vaultState(month, txns),
+    vault: { ...perMonth, totalCent: balanceCent },
     hero: B.safeToSpendToday(month, txns, now),
     poolLeftCent: B.spendablePool(month, txns).leftCent,
     pace: B.paceDelta(month, txns, now),
@@ -406,6 +471,38 @@ async function undoTxn(id) {
   return true;
 }
 
+/**
+ * Reverse a month's close so it can be edited again.
+ *
+ * store.reopenMonth clears `closedAt` AND `sweep`, which puts the month back
+ * in the close queue — so per its JSDoc the caller must have reversed the
+ * ORIGINAL sweep first, or those same leftovers get swept into the vault a
+ * second time when the month closes again.
+ *
+ * Two halves to that reversal, and both are required:
+ *   - the month's `sweep` record, which is what vaultBalance actually adds up.
+ *     reopenMonth clears it, so the vault stops counting it the moment we
+ *     return.
+ *   - the kind:'sweep' TXN row. budget.js ignores sweep rows so it changes no
+ *     local number, but it is a real row in the Google Sheet. Leave it and the
+ *     re-close appends a second one, and SUM(E:E) counts the sweep twice —
+ *     the same defect as the rollover double-write, arrived at from the other
+ *     direction. undoTxn picks void-vs-delete off the synced flag, so a row
+ *     the server already has gets a compensating tombstone rather than
+ *     vanishing locally and living forever remotely.
+ *
+ * @returns {Promise<{ok:boolean, error?:string}>}
+ */
+async function reopenMonthForEdit(key) {
+  const res = store.reopenMonth(key);
+  if (!res.ok) return res;
+  const rows = await idb.getTxns(key);
+  for (const t of rows) {
+    if (t?.kind === "sweep") await undoTxn(t.id);
+  }
+  return { ok: true };
+}
+
 async function saveIncome() {
   const panel = app.querySelector(".sheet-panel");
   const amountInput = panel?.querySelector(".amount-input");
@@ -422,8 +519,22 @@ async function saveIncome() {
   let reopening = false;
   if (existing?.closedAt) {
     if (
-      !confirm(`${monthLabel(key)} is already closed. Reopen and edit income?`)
+      !confirm(
+        `${monthLabel(key)} is already closed. Reopen and edit income?\n\n` +
+          `This reverses the month-close sweep — those leftovers go back to ` +
+          `their envelopes and out of the vault.`,
+      )
     ) {
+      return;
+    }
+    // upsertMonth REFUSES every write to a closed month and returns the stored
+    // record, so this has to happen before the write or the whole edit is a
+    // silent no-op: the user confirms, types a number, the sheet closes, and
+    // nothing changed.
+    const res = await reopenMonthForEdit(key);
+    if (!res.ok) {
+      R.showAmountError(panel, res.error || "Could not reopen that month");
+      amountInput?.focus();
       return;
     }
     reopening = true;
@@ -439,6 +550,7 @@ async function saveIncome() {
   if (existing?.sweep && !reopening) rec.sweep = existing.sweep;
   if (existing?.closedAt && !reopening) rec.closedAt = existing.closedAt;
   store.upsertMonth(rec);
+  if (reopening) sync.kick();
 
   closeSheet();
   await renderFull();
@@ -566,34 +678,62 @@ async function deleteFromHistory(id) {
  * Month rollover — idempotent, safe to call repeatedly
  * ------------------------------------------------------------------ */
 
+/** True while runRollover is mid-flight. See the re-entrancy note below. */
+let rolloverRunning = false;
+
 async function runRollover() {
-  const months = store.getMonths();
-  const keys = B.monthsToClose(months, Date.now());
-  for (const key of keys) {
-    const month = store.getMonth(key);
-    if (!month) continue;
-    const txns = await idb.getTxns(key);
-    const sweep = B.computeSweep(month, txns);
-    const closed = store.closeMonth(key, sweep);
-    if (!closed) continue;
-    // kind:'sweep' rows are excluded from all spend math regardless of
-    // categoryId (see budget.js spendIndex) — this is bookkeeping/display
-    // only, so tag it with whichever category is the vault in this month's
-    // own snapshot rather than assuming the default settings id "save".
-    const vaultId = closed.alloc.find((a) => a.vault)?.id ?? "save";
-    await idb.addTxn({
-      id: uid(),
-      monthKey: key,
-      ts: Date.now(),
-      cent: sweep.toVaultCent,
-      categoryId: vaultId,
-      note: "Month close sweep",
-      kind: "sweep",
-      synced: 0,
-      deleted: 0,
-    });
+  // RE-ENTRANCY. This runs on boot AND on every visibilitychange, and it
+  // awaits IDB inside the loop. Two overlapping passes both see the month as
+  // open, and while store.closeMonth is idempotent it RETURNS the already-
+  // closed record — truthy — so a `if (!closed)` check waves the second pass
+  // through and a second kind:'sweep' row gets appended with a fresh uid().
+  // A fresh uid is a fresh idempotency key, so the server cannot dedupe it and
+  // the sheet's SUM(E:E) double-counts the sweep. budget.js ignores sweep rows
+  // so the app itself stays right, which is exactly why this would go unseen.
+  if (rolloverRunning) return;
+  rolloverRunning = true;
+  try {
+    const months = store.getMonths();
+    const keys = B.monthsToClose(months, Date.now());
+    let closedAny = false;
+    for (const key of keys) {
+      const month = store.getMonth(key);
+      if (!month) continue;
+      // Re-read INSIDE the loop, after the await: the state that mattered was
+      // captured before we yielded. If it is already closed, someone else did
+      // it and the sweep row is already theirs to write.
+      if (month.closedAt) continue;
+      const txns = await idb.getTxns(key);
+      const fresh = store.getMonth(key);
+      if (!fresh || fresh.closedAt) continue;
+      const sweep = B.computeSweep(fresh, txns);
+      const closed = store.closeMonth(key, sweep);
+      // closeMonth returns the record whether WE closed it or it was already
+      // closed. The sweep row may only be written for a real transition, so
+      // gate on closedAt having been absent immediately before the call.
+      if (!closed) continue;
+      closedAny = true;
+      // kind:'sweep' rows are excluded from all spend math regardless of
+      // categoryId (see budget.js spendIndex) — this is bookkeeping/display
+      // only, so tag it with whichever category is the vault in this month's
+      // own snapshot rather than assuming the default settings id "save".
+      const vaultId = closed.alloc.find((a) => a.vault)?.id ?? "save";
+      await idb.addTxn({
+        id: uid(),
+        monthKey: key,
+        ts: Date.now(),
+        cent: sweep.toVaultCent,
+        categoryId: vaultId,
+        note: "Month close sweep",
+        kind: "sweep",
+        synced: 0,
+        deleted: 0,
+      });
+    }
+    if (closedAny && ui.screen === "home" && !ui.sheet) await renderFull();
+  } finally {
+    rolloverRunning = false;
   }
-  if (keys.length && ui.screen === "home" && !ui.sheet) await renderFull();
 }
 
 /* ------------------------------------------------------------------ *
@@ -618,17 +758,21 @@ app.addEventListener("click", (e) => {
     case "toggle-note":
       R.toggleNoteRow(app.querySelector(".sheet-panel"));
       break;
-    case "add-expense":
-      commitExpense(el.getAttribute("data-cat-id"));
+    // The three money-writing paths. Each is wrapped so a double-tap inside
+    // the await window can't book the same row twice — see guarded().
+    case "add-expense": {
+      const catId = el.getAttribute("data-cat-id");
+      guarded(a, () => commitExpense(catId));
       break;
+    }
     case "save-income":
-      saveIncome();
+      guarded(a, saveIncome);
       break;
     case "open-withdraw":
       openWithdrawSheet();
       break;
     case "commit-withdraw":
-      commitWithdrawal();
+      guarded(a, commitWithdrawal);
       break;
     case "save-categories":
       saveCategories();
@@ -724,7 +868,13 @@ async function boot() {
   await renderFull();
 
   document.addEventListener("visibilitychange", () => {
-    if (document.visibilityState === "visible") runRollover();
+    if (document.visibilityState !== "visible") return;
+    runRollover();
+    // An installed home-screen PWA is resumed, not cold-started, so without
+    // this a deploy can sit in the `waiting` state for days. checkForUpdate
+    // re-checks and tells any waiting worker to skipWaiting; it swallows all
+    // errors and is a no-op when no SW is registered.
+    checkForUpdate();
   });
 
   store.requestPersist();

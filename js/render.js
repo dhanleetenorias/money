@@ -88,8 +88,22 @@ export function esc(str) {
     .replace(/'/g, "&#39;");
 }
 
+/**
+ * Coerce to a finite number inside [lo,hi]. Used for anything that lands in a
+ * style/width attribute: a non-number must become 0, never reach the markup as
+ * text. This is the numeric sibling of esc() — between the two, EVERY `${}` in
+ * an attribute context in this file is either esc()'d or forced numeric.
+ */
+function num(v, lo, hi) {
+  const n = Number(v);
+  if (!Number.isFinite(n)) return lo;
+  return n < lo ? lo : n > hi ? hi : n;
+}
+
 function daysWord(n) {
-  return `${n} day${n === 1 ? "" : "s"}`;
+  const c = Number(n);
+  const safe = Number.isFinite(c) ? c : 0;
+  return `${safe} day${safe === 1 ? "" : "s"}`;
 }
 
 /** One sentence from a budget.paceDelta() result. */
@@ -113,21 +127,23 @@ function paceLine(pace) {
 function renderPace(pace) {
   const line = paceLine(pace);
   if (!line) return "";
-  return `<p class="pace ${line.cls}">${esc(line.text)}</p>`;
+  return `<p class="pace ${esc(line.cls)}">${esc(line.text)}</p>`;
 }
 
 /** One envelope row: name, bar with pace tick, % micro-label, ₱ left. */
 function renderEnvRow(env, paceTick) {
-  const fillRatio = Math.max(0, Math.min(1, env.ratio));
+  // Numeric coercion is itself an escape: a non-number lands as 0 rather than
+  // reaching the style attribute as text.
+  const fillRatio = num(env.ratio, 0, 1);
   // The micro-label is the envelope's ALLOCATION share ("30%"), which is fixed
   // and identifies the envelope. Using env.ratio here showed spend-so-far, so
   // every row read "0%" on a fresh month.
   const pctLabel = Math.round(Number(env.pct) || 0);
-  const tickPct = (Math.max(0, Math.min(1, paceTick)) * 100).toFixed(2);
+  const tickPct = (num(paceTick, 0, 1) * 100).toFixed(2);
   const overLine = env.over
     ? `<span class="env-over">Over by ${fmt(env.overCent)}</span>`
     : "";
-  return `<div class="env env--${env.state}" data-id="${esc(env.id)}">
+  return `<div class="env env--${esc(env.state)}" data-id="${esc(env.id)}">
     <span class="env-name">${esc(env.name)}</span>
     <div class="env-bar">
       <div class="env-fill" style="transform:scaleX(${fillRatio})"></div>

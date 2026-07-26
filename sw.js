@@ -1,4 +1,13 @@
-const V = "money-2026-07-27a";
+/**
+ * BUMP `V` ON EVERY DEPLOY. No exceptions.
+ *
+ * `activate` deletes every cache whose key isn't V, so the version string is
+ * the ONLY thing that evicts stale assets. index.html and everything under
+ * /js/ are network-first and self-heal, but app.css is CACHE-FIRST: leave V
+ * alone and an installed home-screen app keeps serving the stylesheet it
+ * first installed, forever, no matter how many times the file changes.
+ */
+const V = "money-2026-07-27b";
 
 const PRECACHE = [
   "./",
@@ -15,6 +24,9 @@ const PRECACHE = [
   "./js/sw-register.js",
   "./manifest.webmanifest",
   "./icons/icon-192.png",
+  // index.html's apple-touch-icon — the iOS home-screen icon. Without it here
+  // an offline install has no icon to fall back on.
+  "./icons/icon-180.png",
   "./favicon.png",
 ];
 

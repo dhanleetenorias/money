@@ -439,6 +439,25 @@ export function envelopePaceTick(month, now) {
  * (it cannot sweep into itself and inflate its own balance), and withdrawals
  * are dropped upstream by kind — a birthday paid from savings during the
  * closing month must not shrink that month's leftovers.
+ *
+ * THE CAP. Flooring each envelope at 0 is right per-envelope but wrong in
+ * aggregate: with Food ₱30,000 overspent to ₱35,000, the untouched envelopes
+ * still show their full leftovers while ₱5,000 of that money is already gone.
+ * Summing the floored leftovers would move money into the vault that does not
+ * exist — and the vault is withdrawable, so the fiction becomes spendable.
+ * The total is therefore capped at what the whole spendable pool actually has
+ * left (which nets the overspend, and nets ghost spend against categories the
+ * snapshot no longer knows).
+ *
+ * RULING ON byCat: when the cap bites, byCat is scaled DOWN proportionally
+ * (largest-remainder, via splitByPct) so it sums to `fromCent` exactly. The
+ * alternative — capping the total and leaving byCat at its raw values — would
+ * print ₱25,000 of line items under a ₱20,000 total in History, which is the
+ * same lie in a smaller font. Proportional attribution is the honest reading:
+ * the overspend was funded out of the pool, so every surviving envelope
+ * contributed to covering it. In the normal case (nothing overspent, no ghost
+ * spend) the cap never binds and byCat is untouched.
+ *
  * @returns {{fromCent:number, byCat:Object<string,number>, toVaultCent:number}}
  */
 export function computeSweep(month, txns) {
@@ -451,16 +470,38 @@ export function computeSweep(month, txns) {
     };
   }
   const { byCat: spent } = spendIndex(month, txns);
-  const byCat = {};
-  let fromCent = 0;
+  const rows = [];
+  let rawCent = 0;
   for (const a of allocOf(month)) {
     if (a.vault) continue;
     const left = (a.allocCent || 0) - (spent.get(a.id) || 0);
     if (left > 0) {
-      byCat[a.id] = left;
-      fromCent += left;
+      rows.push({ id: a.id, left });
+      rawCent += left;
     }
   }
+
+  // Never move more than the pool actually holds, and never a negative.
+  const capCent = Math.max(0, spendablePool(month, txns).leftCent);
+  const fromCent = Math.min(rawCent, capCent);
+
+  const byCat = {};
+  if (fromCent === rawCent) {
+    for (const r of rows) byCat[r.id] = r.left;
+  } else {
+    // splitByPct distributes `fromCent` across the leftovers by weight and
+    // hands out the remainder cent-by-cent, so the parts sum to fromCent
+    // exactly — byCat can never total more than the money that moved.
+    const parts = splitByPct(
+      fromCent,
+      rows.map((r) => r.left),
+    );
+    rows.forEach((r, i) => {
+      const part = parts[i] ?? 0;
+      if (part > 0) byCat[r.id] = part;
+    });
+  }
+
   return { fromCent, byCat, toVaultCent: fromCent };
 }
 
