@@ -13,6 +13,9 @@ import {
   envelopePaceTick,
   computeSweep,
   monthsToClose,
+  vaultBalance,
+  maxWithdrawable,
+  planWithdrawal,
 } from "../js/budget.js";
 
 const CATS = [
@@ -60,16 +63,67 @@ function tx(monthKey, categoryId, cent, extra = {}) {
 
 // ---- the invariant a reviewer greps for ------------------------------------
 
-test("budget.js does not import store.js or settings", () => {
+test("a live Settings edit cannot reach a snapshotted month (behavioural)", async () => {
+  // The real invariant, tested through behaviour rather than a source-text
+  // regex — a regex misses a dynamic import() or a transitive one. We mutate
+  // the actual store (which budget.js would have to consult to be wrong) and
+  // assert the already-derived numbers do not move.
+  const mem = new Map();
+  globalThis.localStorage = {
+    getItem: (k) => (mem.has(k) ? mem.get(k) : null),
+    setItem: (k, v) => mem.set(k, String(v)),
+    removeItem: (k) => mem.delete(k),
+    clear: () => mem.clear(),
+  };
+  const store = await import("../js/store.js");
+
+  const month = newMonthFromSettings(
+    { categories: store.getCategories() },
+    "2026-07",
+    INCOME,
+    0,
+  );
+  const before = {
+    coffee: envelopeState(month, [], "coffee").allocCent,
+    pool: spendablePool(month, []).allocCent,
+    vault: vaultState(month, []).allocCent,
+    envs: allEnvelopes(month, [], manila(2026, 7, 10)).map((e) => e.allocCent),
+  };
+
+  // Rebalance hard in the live store: coffee 8% -> 1%, save 45% -> 52%.
+  const edited = store
+    .getCategories()
+    .map((c) =>
+      c.id === "coffee"
+        ? { ...c, pct: 1 }
+        : c.id === "save"
+          ? { ...c, pct: 52 }
+          : c,
+    );
+  assert.equal(store.setCategories(edited).ok, true);
+  assert.equal(store.getCategories().find((c) => c.id === "coffee").pct, 1);
+
+  assert.equal(envelopeState(month, [], "coffee").allocCent, before.coffee);
+  assert.equal(spendablePool(month, []).allocCent, before.pool);
+  assert.equal(vaultState(month, []).allocCent, before.vault);
+  assert.deepEqual(
+    allEnvelopes(month, [], manila(2026, 7, 10)).map((e) => e.allocCent),
+    before.envs,
+  );
+  assert.equal(before.coffee, 200000);
+
+  delete globalThis.localStorage;
+});
+
+test("budget.js declares no static dependency on the store module", () => {
+  // Cheap belt-and-braces alongside the behavioural test above: check the
+  // import statements only, so a mention in a comment doesn't fail the build.
   const src = readFileSync(new URL("../js/budget.js", import.meta.url), "utf8");
-  assert.ok(
-    !/from\s+["'].*store(\.js)?["']/.test(src),
-    "budget.js imports store.js",
-  );
-  assert.ok(
-    !/getSettings|getCategories/.test(src),
-    "budget.js reads live settings",
-  );
+  const imports = [
+    ...src.matchAll(/^\s*import[\s\S]*?from\s+["']([^"']+)["']/gm),
+  ].map((m) => m[1]);
+  assert.deepEqual(imports, ["./money.js"]);
+  assert.ok(!/\bimport\s*\(/.test(src), "budget.js uses a dynamic import");
 });
 
 // ---- month construction ----------------------------------------------------
@@ -285,8 +339,9 @@ test("safeToSpendToday: a past month divides by the whole month, not a stale tod
   assert.equal(safe.cent, Math.floor((INCOME - 1125000) / 30));
 });
 
-test("safeToSpendToday: never negative across a fuzz of spend levels", () => {
+test("safeToSpendToday: exact value across a fuzz of days and spend levels", () => {
   const m = july();
+  const poolAlloc = INCOME - 1125000; // 1,375,000
   for (let day = 1; day <= 31; day++) {
     for (const spend of [0, 1, 500000, 1374999, 1375000, 1375001, 9999999]) {
       const s = safeToSpendToday(
@@ -294,8 +349,24 @@ test("safeToSpendToday: never negative across a fuzz of spend levels", () => {
         [tx("2026-07", "food", spend)],
         manila(2026, 7, day),
       );
-      assert.ok(s.cent >= 0, `negative at day ${day} spend ${spend}`);
-      assert.ok(s.daysLeft >= 1);
+      const left = poolAlloc - spend;
+      const daysLeft = 31 - day + 1;
+      // Assert the ACTUAL number, not merely that it isn't negative — the old
+      // version of this test would have passed on a function returning 0.
+      assert.equal(s.daysLeft, daysLeft, `daysLeft at day ${day}`);
+      if (left <= 0) {
+        assert.equal(s.cent, 0, `day ${day} spend ${spend}`);
+        assert.equal(s.basis, "zero");
+      } else {
+        // Note floor(): 1c left across 31 days is legitimately 0, but the
+        // basis stays 'even' because the pool is not actually exhausted.
+        assert.equal(
+          s.cent,
+          Math.floor(left / daysLeft),
+          `day ${day} spend ${spend}`,
+        );
+        assert.equal(s.basis, "even");
+      }
     }
   }
 });
@@ -443,6 +514,198 @@ test("monthsToClose: a month opened near the Manila month boundary is not closed
   ]);
 });
 
+// ---- vault withdrawals -----------------------------------------------------
+
+/** A withdrawal: vault category, required reason in `note`. */
+function withdraw(monthKey, cent, note = "birthday gift") {
+  return tx(monthKey, "save", cent, { kind: "withdrawal", note });
+}
+
+test("a withdrawal reduces vaultState().totalCent by exactly its amount", () => {
+  const m = july();
+  const base = vaultState(m, []);
+  assert.equal(base.allocCent, 1125000);
+  assert.equal(base.withdrawnCent, 0);
+  assert.equal(base.totalCent, 1125000);
+
+  const one = vaultState(m, [withdraw("2026-07", 200000)]);
+  assert.equal(one.withdrawnCent, 200000);
+  assert.equal(one.totalCent, 1125000 - 200000);
+  assert.equal(one.allocCent, 1125000, "allocation itself must not move");
+
+  const two = vaultState(m, [
+    withdraw("2026-07", 200000),
+    withdraw("2026-07", 50000),
+  ]);
+  assert.equal(two.withdrawnCent, 250000);
+  assert.equal(two.totalCent, 1125000 - 250000);
+});
+
+test("vaultState.totalCent floors at 0 and ignores other months' withdrawals", () => {
+  const m = july();
+  assert.equal(vaultState(m, [withdraw("2026-07", 99999999)]).totalCent, 0);
+  assert.equal(vaultState(m, [withdraw("2026-06", 200000)]).withdrawnCent, 0);
+  // A tombstoned withdrawal doesn't count.
+  assert.equal(
+    vaultState(m, [
+      tx("2026-07", "save", 200000, { kind: "withdrawal", deleted: 1 }),
+    ]).withdrawnCent,
+    0,
+  );
+});
+
+test("a withdrawal changes NOTHING about the spendable side", () => {
+  const m = july();
+  const now = manila(2026, 7, 17, 0);
+  const spend = [tx("2026-07", "food", 300000), tx("2026-07", "gas", 40000)];
+  const withWithdrawal = [...spend, withdraw("2026-07", 500000)];
+
+  // This is the whole product requirement: the daily number must not move.
+  assert.deepEqual(
+    safeToSpendToday(m, withWithdrawal, now),
+    safeToSpendToday(m, spend, now),
+  );
+  assert.deepEqual(spendablePool(m, withWithdrawal), spendablePool(m, spend));
+  assert.deepEqual(
+    allEnvelopes(m, withWithdrawal, now),
+    allEnvelopes(m, spend, now),
+  );
+  assert.deepEqual(paceDelta(m, withWithdrawal, now), paceDelta(m, spend, now));
+  assert.deepEqual(
+    envelopeState(m, withWithdrawal, "food", now),
+    envelopeState(m, spend, "food", now),
+  );
+
+  // And the vault DID move, so the assertions above aren't vacuous.
+  assert.notEqual(
+    vaultState(m, withWithdrawal).totalCent,
+    vaultState(m, spend).totalCent,
+  );
+});
+
+test("a withdrawal is not absorbed even when the vault id is absent from alloc", () => {
+  // The likeliest leak: excluded by CATEGORY rather than by KIND, so a
+  // withdrawal whose categoryId isn't in the snapshot falls through to
+  // `otherSpent` and quietly shrinks safeToSpendToday.
+  const noVault = newMonthFromSettings(
+    {
+      categories: CATS.filter((c) => !c.vault).map((c) => ({
+        ...c,
+        pct: c.pct * 2,
+      })),
+    },
+    "2026-07",
+    INCOME,
+    0,
+  );
+  const now = manila(2026, 7, 10);
+  const before = safeToSpendToday(noVault, [], now);
+  const after = safeToSpendToday(noVault, [withdraw("2026-07", 400000)], now);
+  assert.deepEqual(after, before, "withdrawal leaked into the spendable pool");
+  assert.equal(
+    spendablePool(noVault, [withdraw("2026-07", 400000)]).spentCent,
+    0,
+  );
+});
+
+test("multi-month: a withdrawal draws on the balance built since January", () => {
+  // Vault built over 3 months, spent in the 3rd — the birthday-in-August case.
+  const months = ["2026-01", "2026-02", "2026-03"].map((k) =>
+    newMonthFromSettings(SETTINGS, k, INCOME, 0),
+  );
+  const perMonth = 1125000;
+  assert.equal(vaultBalance(months, []).balanceCent, perMonth * 3);
+  assert.equal(vaultBalance(months, []).months, 3);
+
+  // ₱20,000 is more than one month's 45% (₱11,250) — the per-month view would
+  // wrongly refuse it. Against the accumulated balance it is fine.
+  const big = 2000000;
+  assert.ok(big > perMonth);
+  assert.equal(maxWithdrawable(months, []), perMonth * 3);
+
+  const txns = [withdraw("2026-03", big)];
+  assert.equal(vaultBalance(months, txns).balanceCent, perMonth * 3 - big);
+  assert.equal(maxWithdrawable(months, txns), perMonth * 3 - big);
+
+  // upToKey excludes later months from the balance.
+  assert.equal(vaultBalance(months, [], "2026-01").balanceCent, perMonth);
+  assert.equal(vaultBalance(months, [], "2026-02").balanceCent, perMonth * 2);
+
+  // Swept-in leftovers add to the balance.
+  const withSweep = months.map((m) =>
+    m.key === "2026-01"
+      ? { ...m, sweep: { doneAt: 1, fromCent: 300000, byCat: {} } }
+      : m,
+  );
+  assert.equal(vaultBalance(withSweep, []).balanceCent, perMonth * 3 + 300000);
+
+  // A duplicated record must not pay into the balance twice.
+  assert.equal(
+    vaultBalance([...months, months[0]], []).balanceCent,
+    perMonth * 3,
+  );
+});
+
+test("the vault cannot go negative: withdrawals are capped", () => {
+  const months = [newMonthFromSettings(SETTINGS, "2026-07", INCOME, 0)];
+  const avail = maxWithdrawable(months, []);
+  assert.equal(avail, 1125000);
+
+  const ok = planWithdrawal(months, [], 200000);
+  assert.deepEqual(ok, { cent: 200000, capped: false, availableCent: avail });
+
+  const tooBig = planWithdrawal(months, [], 5000000);
+  assert.equal(tooBig.cent, avail);
+  assert.equal(tooBig.capped, true);
+
+  // Once drained, the max is 0 and never negative.
+  const drained = [withdraw("2026-07", avail)];
+  assert.equal(maxWithdrawable(months, drained), 0);
+  assert.equal(planWithdrawal(months, drained, 100).cent, 0);
+  assert.equal(vaultBalance(months, drained).balanceCent, 0);
+
+  // Over-withdrawal already on record still floors at 0.
+  assert.equal(maxWithdrawable(months, [withdraw("2026-07", avail * 2)]), 0);
+  assert.equal(planWithdrawal(months, [], -500).cent, 0);
+  assert.equal(planWithdrawal(months, [], NaN).cent, 0);
+});
+
+test("maxWithdrawable accepts a single MonthRec as well as a collection", () => {
+  const m = july();
+  assert.equal(maxWithdrawable(m, []), 1125000);
+  assert.equal(maxWithdrawable({ "2026-07": m }, []), 1125000);
+  assert.equal(maxWithdrawable([m], []), 1125000);
+  assert.equal(maxWithdrawable(m, [withdraw("2026-07", 125000)]), 1000000);
+});
+
+test("a withdrawal during the closing month does not distort computeSweep", () => {
+  const m = july();
+  const spend = [tx("2026-07", "food", 700000)];
+  const expected = computeSweep(m, spend);
+
+  const withDraw = computeSweep(m, [...spend, withdraw("2026-07", 400000)]);
+  assert.deepEqual(withDraw, expected, "withdrawal changed the sweep figure");
+  assert.ok(!("save" in withDraw.byCat), "vault must never sweep into itself");
+
+  // Close on the withdrawal-inclusive figure, then confirm idempotency holds
+  // and the vault counts alloc + sweep − withdrawal exactly once.
+  m.closedAt = Date.now();
+  m.sweep = {
+    doneAt: Date.now(),
+    fromCent: withDraw.fromCent,
+    byCat: withDraw.byCat,
+  };
+  assert.deepEqual(
+    computeSweep(m, [...spend, withdraw("2026-07", 400000)]),
+    expected,
+  );
+
+  const v = vaultState(m, [...spend, withdraw("2026-07", 400000)]);
+  assert.equal(v.sweptInCent, expected.fromCent);
+  assert.equal(v.withdrawnCent, 400000);
+  assert.equal(v.totalCent, 1125000 + expected.fromCent - 400000);
+});
+
 // ---- transaction filing across the month boundary --------------------------
 
 test("a txn near midnight on the 31st files to the right month's envelope", () => {
@@ -462,8 +725,69 @@ test("a txn near midnight on the 31st files to the right month's envelope", () =
 
 // ---- robustness ------------------------------------------------------------
 
-test("derived reads survive junk input without throwing", () => {
-  const junk = { key: "2026-07" };
+test("F3 derived reads survive a MISSING or corrupt month key", () => {
+  const now = manila(2026, 7, 5);
+  // The previous version of this test used {key:"2026-07"} — a VALID key —
+  // so it never exercised the path that actually threw. These are the shapes
+  // importJSON used to let through.
+  const shapes = [
+    {},
+    { alloc: [] },
+    { key: null, alloc: [] },
+    { key: "", alloc: [] },
+    { key: "2026-13", alloc: [] },
+    { key: "2026-7", alloc: [] },
+    { key: 202607, alloc: [] },
+    { key: "garbage", alloc: [{ id: "food", pct: 30, allocCent: 750000 }] },
+    null,
+    undefined,
+  ];
+  for (const bad of shapes) {
+    const label = JSON.stringify(bad);
+    assert.doesNotThrow(
+      () => safeToSpendToday(bad, [], now),
+      `safeToSpendToday ${label}`,
+    );
+    assert.doesNotThrow(
+      () => allEnvelopes(bad, [], now),
+      `allEnvelopes ${label}`,
+    );
+    assert.doesNotThrow(() => spendablePool(bad, []), `spendablePool ${label}`);
+    assert.doesNotThrow(() => paceDelta(bad, [], now), `paceDelta ${label}`);
+    assert.doesNotThrow(() => vaultState(bad, []), `vaultState ${label}`);
+    assert.doesNotThrow(() => computeSweep(bad, []), `computeSweep ${label}`);
+    assert.doesNotThrow(
+      () => envelopePaceTick(bad, now),
+      `envelopePaceTick ${label}`,
+    );
+    assert.doesNotThrow(
+      () => envelopeState(bad, [], "food", now),
+      `envelopeState ${label}`,
+    );
+    assert.doesNotThrow(
+      () => maxWithdrawable(bad, []),
+      `maxWithdrawable ${label}`,
+    );
+
+    const s = safeToSpendToday(bad, [], now);
+    assert.ok(s.cent >= 0 && s.daysLeft >= 1, `sane result for ${label}`);
+  }
+
+  // The exact repro from the review.
+  assert.doesNotThrow(() => safeToSpendToday({ alloc: [] }, [], new Date()));
+
+  // A corrupt key must not enter the close queue, where the close would throw.
+  assert.deepEqual(
+    monthsToClose([{ key: "2026-13" }, { key: "bad" }], now),
+    [],
+  );
+  assert.doesNotThrow(() =>
+    monthsToClose([{ key: "2026-13" }], new Date("nope")),
+  );
+});
+
+test("derived reads survive junk txns and an empty alloc", () => {
+  const junk = { key: "2026-07", alloc: [] };
   assert.deepEqual(allEnvelopes(junk, null, manila(2026, 7, 5)), []);
   assert.deepEqual(spendablePool(junk, undefined), {
     allocCent: 0,
@@ -474,4 +798,9 @@ test("derived reads survive junk input without throwing", () => {
   assert.equal(computeSweep(junk, []).fromCent, 0);
   assert.equal(vaultState(junk, []).totalCent, 0);
   assert.equal(paceDelta(junk, [], manila(2026, 7, 5)).deltaCent, 0);
+
+  const m = july();
+  const nonsense = [null, undefined, {}, { cent: "x" }, { kind: "withdrawal" }];
+  assert.doesNotThrow(() => vaultState(m, nonsense));
+  assert.equal(vaultState(m, nonsense).withdrawnCent, 0);
 });

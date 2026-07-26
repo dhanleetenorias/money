@@ -15,6 +15,8 @@
  * exportJSON — see stripSecrets().
  */
 
+import { isMonthKey } from "./money.js";
+
 const SETTINGS_KEY = "mn.settings.v1";
 const MONTHS_KEY = "mn.months.v1";
 
@@ -148,6 +150,38 @@ export function getCategories() {
 }
 
 /**
+ * The single gate every category set must pass, whether it arrives from the
+ * Settings screen or from a restored backup. A set totalling anything but 100
+ * would allocate only part of each month's income and silently vaporise the
+ * rest, so import cannot be allowed its own laxer rule.
+ *
+ * @param {{id,name,pct,vault?}[]} cats
+ * @returns {{ok:true, categories:object[]}|{ok:false, error:string}}
+ */
+function validateCategories(cats) {
+  const clean = normalizeCategories(cats);
+  if (!clean.length) {
+    return { ok: false, error: "At least one category is required" };
+  }
+  if (clean.some((c) => c.pct < 0)) {
+    return { ok: false, error: "Percentages cannot be negative" };
+  }
+  const ids = new Set(clean.map((c) => c.id));
+  if (ids.size !== clean.length) {
+    return { ok: false, error: "Duplicate category id" };
+  }
+  // Integer comparison: 45.5 + 54.5 must not fail on binary float slop.
+  const total = clean.reduce((s, c) => s + Math.round(c.pct * 1e6), 0);
+  if (total !== 100 * 1e6) {
+    return {
+      ok: false,
+      error: `Percentages must total 100 (currently ${total / 1e6})`,
+    };
+  }
+  return { ok: true, categories: clean };
+}
+
+/**
  * Replace the category set.
  *
  * CONTRACT: returns {ok:true, categories} or {ok:false, error} — it never
@@ -159,24 +193,9 @@ export function getCategories() {
  * @returns {{ok:true, categories:object[]}|{ok:false, error:string}}
  */
 export function setCategories(cats) {
-  const clean = normalizeCategories(cats);
-  if (!clean.length)
-    return { ok: false, error: "At least one category is required" };
-  if (clean.some((c) => c.pct < 0)) {
-    return { ok: false, error: "Percentages cannot be negative" };
-  }
-  const ids = new Set(clean.map((c) => c.id));
-  if (ids.size !== clean.length)
-    return { ok: false, error: "Duplicate category id" };
-
-  // Integer comparison: 45.5 + 54.5 must not fail on binary float slop.
-  const total = clean.reduce((s, c) => s + Math.round(c.pct * 1e6), 0);
-  if (total !== 100 * 1e6) {
-    return {
-      ok: false,
-      error: `Percentages must total 100 (currently ${total / 1e6})`,
-    };
-  }
+  const check = validateCategories(cats);
+  if (!check.ok) return check;
+  const clean = check.categories;
 
   const next = { ...getSettings(), categories: clean, v: 1 };
   if (!safeSet(SETTINGS_KEY, next)) {
@@ -197,13 +216,56 @@ export function getMonth(key) {
   return getMonths()[key] ?? null;
 }
 
-/** Insert or replace a month record. @returns {object|null} the stored record */
+/**
+ * Insert or replace a month record.
+ *
+ * RULING: a CLOSED month is immutable here — the write is refused and the
+ * stored record returned untouched. Merge-preserving `closedAt`/`sweep` was
+ * the alternative, but it would still let the alloc snapshot be rewritten,
+ * which is the very thing the snapshot exists to prevent (a Settings edit
+ * followed by a routine upsert was observed rewriting July's coffee envelope
+ * from ₱2,000 to ₱250). Refusing keeps history genuinely append-only.
+ *
+ * A closed month re-entering the close queue would also sweep its leftovers
+ * into the vault a second time, and with withdrawals in play that makes the
+ * vault balance incoherent. Reopening must therefore be deliberate:
+ * see reopenMonth().
+ *
+ * @returns {object|null} the stored record, or null if the input was unusable
+ */
 export function upsertMonth(rec) {
-  if (!rec || typeof rec.key !== "string" || !rec.key) return null;
+  if (!rec || !isMonthKey(rec.key)) return null;
   const payload = safeGet(MONTHS_KEY, "months");
+  const existing = payload.months[rec.key];
+  if (existing?.closedAt) return existing;
   payload.months[rec.key] = rec;
   safeSetMonths(payload);
   return rec;
+}
+
+/**
+ * Deliberately reopen a closed month so it can be edited again.
+ *
+ * Clears `closedAt` AND `sweep`, which puts the month back in the close queue
+ * — so the caller is responsible for having reversed the original sweep first
+ * (otherwise those leftovers land in the vault twice). Never called on a
+ * normal write path; exists so that reopening can't happen by accident.
+ *
+ * @returns {{ok:true, month:object}|{ok:false, error:string}}
+ */
+export function reopenMonth(key) {
+  if (!isMonthKey(key)) return { ok: false, error: "Invalid month key" };
+  const payload = safeGet(MONTHS_KEY, "months");
+  const rec = payload.months[key];
+  if (!rec) return { ok: false, error: "No such month" };
+  if (!rec.closedAt) return { ok: true, month: rec };
+  rec.closedAt = null;
+  rec.sweep = null;
+  payload.months[key] = rec;
+  if (!safeSetMonths(payload)) {
+    return { ok: false, error: "Failed to write to storage" };
+  }
+  return { ok: true, month: rec };
 }
 
 /**
@@ -297,13 +359,33 @@ export function importJSON(str) {
     if (!rec || typeof rec !== "object" || !Array.isArray(rec.alloc)) {
       return { ok: false, error: `Invalid month record "${key}"` };
     }
+    // The key must be usable on BOTH sides. A record whose own `key` is
+    // missing or malformed reaches every derived function and used to crash
+    // the dashboard — a backup is exactly how such a record gets in.
+    if (!isMonthKey(key)) {
+      return { ok: false, error: `Invalid month key "${key}"` };
+    }
+    if (!isMonthKey(rec.key)) {
+      return { ok: false, error: `Month "${key}" has an invalid key field` };
+    }
+    if (rec.key !== key) {
+      return {
+        ok: false,
+        error: `Month "${key}" disagrees with its key field`,
+      };
+    }
   }
 
-  const cats = normalizeCategories(settings.categories);
+  // Same 100%-total gate as the Settings screen. A backup carrying [10,10]
+  // would otherwise allocate 20% of every future month and lose the rest.
+  const check = validateCategories(settings.categories);
+  if (!check.ok) {
+    return { ok: false, error: `Invalid categories: ${check.error}` };
+  }
   const merged = {
     ...defaultSettings(),
     ...settings,
-    categories: cats.length ? cats : defaultSettings().categories,
+    categories: check.categories,
     token: getToken(),
     v: 1,
   };

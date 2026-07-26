@@ -1,0 +1,10 @@
+{
+  "name": "money",
+  "private": true,
+  "type": "module",
+  "description": "Personal fixed-percentage money tracker. Zero-build: this file exists only so `node --test` resolves dynamic import() of ./js/*.js as ES modules — there are no dependencies and nothing is ever installed or built.",
+  "scripts": {
+    "test": "node --test test/",
+    "dev": "python3 -m http.server 8080"
+  }
+}

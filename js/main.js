@@ -189,21 +189,25 @@ async function saveIncome() {
 
   const key = ym(Date.now());
   const existing = store.getMonth(key);
+  let reopening = false;
   if (existing?.closedAt) {
     if (
       !confirm(`${monthLabel(key)} is already closed. Reopen and edit income?`)
     ) {
       return;
     }
-    existing.closedAt = null;
+    reopening = true;
   }
   // Editing an open month re-snapshots alloc from current settings — same
   // path as opening a fresh one, per budget.js's newMonthFromSettings contract.
+  // Reopening drops the old sweep/closedAt: that sweep was computed against
+  // the alloc being replaced here, so keeping it would let a later close
+  // replay stale numbers against a fresh allocation.
   const settings = store.getSettings();
   const openedAt = existing?.openedAt ?? Date.now();
   const rec = B.newMonthFromSettings(settings, key, cent, openedAt);
-  if (existing?.sweep) rec.sweep = existing.sweep;
-  if (existing?.closedAt) rec.closedAt = existing.closedAt;
+  if (existing?.sweep && !reopening) rec.sweep = existing.sweep;
+  if (existing?.closedAt && !reopening) rec.closedAt = existing.closedAt;
   store.upsertMonth(rec);
 
   closeSheet();
@@ -224,12 +228,17 @@ async function runRollover() {
     const sweep = B.computeSweep(month, txns);
     const closed = store.closeMonth(key, sweep);
     if (!closed) continue;
+    // kind:'sweep' rows are excluded from all spend math regardless of
+    // categoryId (see budget.js spendIndex) — this is bookkeeping/display
+    // only, so tag it with whichever category is the vault in this month's
+    // own snapshot rather than assuming the default settings id "save".
+    const vaultId = closed.alloc.find((a) => a.vault)?.id ?? "save";
     await idb.addTxn({
       id: uid(),
       monthKey: key,
       ts: Date.now(),
       cent: sweep.toVaultCent,
-      categoryId: "save",
+      categoryId: vaultId,
       note: "Month close sweep",
       kind: "sweep",
       synced: 0,
@@ -245,9 +254,8 @@ async function runRollover() {
 
 app.addEventListener("click", (e) => {
   const el = e.target.closest("[data-action]");
-  const onBackdrop = e.target.classList?.contains("sheet-backdrop");
-  if (!el && !onBackdrop) return;
-  const a = onBackdrop ? "close-sheet" : el.getAttribute("data-action");
+  if (!el) return;
+  const a = el.getAttribute("data-action");
 
   switch (a) {
     case "open-add":

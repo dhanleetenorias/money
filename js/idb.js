@@ -27,6 +27,22 @@ const FALLBACK_KEY = "mn.idbfallback.v1";
 let dbPromise = null;
 let useFallback = false;
 
+/**
+ * id -> `seq` of the outbox row most recently handed to a pusher by
+ * getOutbox(). This is what lets clearOutbox() tell "the server acked the row
+ * I sent" apart from "the server acked an OLDER row that has since been
+ * replaced by a void".
+ *
+ * Enqueueing (addTxn/voidTxn) DELETES the entry, so a row that was written
+ * after a push is never mistaken for the row that was pushed. The match is
+ * exact — a stale entry can only ever cause a re-push, which is idempotent by
+ * id, whereas a wrong delete loses a real deletion permanently.
+ *
+ * In memory only: after a reload nothing is in flight, so every row is
+ * legitimately re-pushable.
+ */
+const handedOut = new Map();
+
 // ---- connection ------------------------------------------------------------
 
 function openDB() {
@@ -119,32 +135,67 @@ function fbWrite(data) {
 
 // ---- normalisation ---------------------------------------------------------
 
+const KINDS = new Set(["expense", "income", "sweep", "withdrawal"]);
+
+/**
+ * Coerce THEN validate. `Number.isFinite("18000")` is false, so testing before
+ * coercing turned a numeric string amount into a silent ₱0 record.
+ * @returns {number|null} rounded integer, or null if genuinely unusable
+ */
+function toInt(value) {
+  if (typeof value === "number" || typeof value === "string") {
+    const n = Number(value);
+    if (Number.isFinite(n)) return Math.round(n);
+  }
+  return null;
+}
+
 function normalize(txn) {
+  const cent = toInt(txn?.cent);
+  const ts = toInt(txn?.ts);
   return {
     id: String(txn?.id ?? ""),
     monthKey: String(txn?.monthKey ?? ""),
-    ts: Number.isFinite(txn?.ts) ? txn.ts : Date.now(),
-    cent: Number.isFinite(txn?.cent) ? Math.round(txn.cent) : 0,
+    ts: ts === null ? Date.now() : ts,
+    cent: cent === null ? 0 : cent,
     categoryId: String(txn?.categoryId ?? ""),
     note: typeof txn?.note === "string" ? txn.note : "",
-    kind:
-      txn?.kind === "income" || txn?.kind === "sweep" ? txn.kind : "expense",
+    // 'withdrawal' = money leaving the vault (categoryId is the vault id).
+    // The required reason lives in `note`; the UI enforces that, since an
+    // empty note is a product concern rather than a storage one.
+    kind: KINDS.has(txn?.kind) ? txn.kind : "expense",
     synced: txn?.synced === 1 ? 1 : 0,
     deleted: txn?.deleted === 1 ? 1 : 0,
   };
 }
 
-function opFor(txn, op) {
-  return { id: txn.id, op, ts: Date.now(), txn: { ...txn } };
+/**
+ * An outbox row. `seq` increments on every enqueue for a given id, so an ack
+ * for an earlier enqueue can be told apart from the row that replaced it.
+ * See clearOutbox().
+ */
+function opFor(txn, op, prevSeq = 0) {
+  return {
+    id: txn.id,
+    op,
+    ts: Date.now(),
+    seq: (Number.isFinite(prevSeq) ? prevSeq : 0) + 1,
+    txn: { ...txn },
+  };
 }
 
 function fbPut(rec, op) {
   const data = fbRead();
+  const prev = data.outbox.find((o) => o.id === rec.id);
   data.txns = data.txns.filter((t) => t.id !== rec.id).concat(rec);
   data.outbox = data.outbox
     .filter((o) => o.id !== rec.id)
-    .concat(opFor(rec, op));
+    .concat(opFor(rec, op, prev?.seq));
   fbWrite(data);
+  // The handed-out mark is intentionally NOT cleared here: a re-enqueue
+  // supersedes whatever a pusher is holding, and leaving the old seq in place
+  // is what makes the stale ack mismatch. Only clearOutbox()/deleteTxn() end
+  // a push cycle.
 }
 
 // ---- API -------------------------------------------------------------------
@@ -165,7 +216,9 @@ export async function addTxn(txn) {
   try {
     const t = db.transaction([TXNS, OUTBOX], "readwrite");
     t.objectStore(TXNS).put(rec);
-    t.objectStore(OUTBOX).put(opFor(rec, "put"));
+    const box = t.objectStore(OUTBOX);
+    const prev = box.get(rec.id);
+    prev.onsuccess = () => box.put(opFor(rec, "put", prev.result?.seq));
     await txDone(t);
   } catch {
     // Storage refused mid-session — keep the money, drop to the fallback.
@@ -190,6 +243,7 @@ export async function deleteTxn(id) {
     data.txns = data.txns.filter((t) => t.id !== key);
     data.outbox = data.outbox.filter((o) => o.id !== key);
     fbWrite(data);
+    forgetHandedOut(key);
     return data.txns.length < before;
   }
   try {
@@ -197,6 +251,7 @@ export async function deleteTxn(id) {
     t.objectStore(TXNS).delete(key);
     t.objectStore(OUTBOX).delete(key);
     await txDone(t);
+    forgetHandedOut(key);
     return true;
   } catch {
     return false;
@@ -218,10 +273,14 @@ export async function voidTxn(id) {
     if (!rec) return null;
     rec.deleted = 1;
     rec.synced = 0;
+    const prev = data.outbox.find((o) => o.id === key);
     data.outbox = data.outbox
       .filter((o) => o.id !== key)
-      .concat(opFor(rec, "void"));
+      .concat(opFor(rec, "void", prev?.seq));
     fbWrite(data);
+    // Deliberately does NOT forget the handed-out seq: leaving the OLD seq in
+    // place is exactly what makes a late ack for the original append mismatch
+    // and get refused, instead of destroying this void.
     return rec;
   }
   try {
@@ -230,6 +289,7 @@ export async function voidTxn(id) {
     // Callback style rather than await between the get and the put: awaiting
     // mid-transaction can let the transaction auto-commit before the write.
     const out = { rec: null };
+    const box = t.objectStore(OUTBOX);
     const get = store.get(key);
     get.onsuccess = () => {
       const rec = get.result;
@@ -237,10 +297,12 @@ export async function voidTxn(id) {
       rec.deleted = 1;
       rec.synced = 0;
       store.put(rec);
-      t.objectStore(OUTBOX).put(opFor(rec, "void"));
+      const prev = box.get(key);
+      prev.onsuccess = () => box.put(opFor(rec, "void", prev.result?.seq));
       out.rec = rec;
     };
     await txDone(t);
+    // See the fallback branch — the mark is intentionally left in place.
     return out.rec;
   } catch {
     return null;
@@ -288,23 +350,60 @@ export async function getAllTxns() {
   }
 }
 
+/** Remember the exact rows a pusher is about to send. See clearOutbox(). */
+function noteHandedOut(rows) {
+  for (const r of rows) {
+    if (r && r.id) handedOut.set(String(r.id), Number(r.seq) || 0);
+  }
+  return rows;
+}
+
+/**
+ * Forget the mark once a push cycle is genuinely over (the row was cleared or
+ * hard-deleted). NOT called when a row is superseded: leaving the old seq in
+ * place is precisely what makes the next ack mismatch and be refused.
+ */
+function forgetHandedOut(id) {
+  handedOut.delete(String(id));
+}
+
 /** @returns {Promise<object[]>} pending sync ops, oldest first. */
 export async function getOutbox() {
   const db = await openDB();
   if (!db)
-    return fbRead()
-      .outbox.slice()
-      .sort((a, b) => a.ts - b.ts);
+    return noteHandedOut(
+      fbRead()
+        .outbox.slice()
+        .sort((a, b) => a.ts - b.ts),
+    );
   try {
     const t = db.transaction([OUTBOX], "readonly");
     const rows = await reqDone(t.objectStore(OUTBOX).getAll());
-    return (rows || []).sort((a, b) => a.ts - b.ts);
+    return noteHandedOut((rows || []).sort((a, b) => a.ts - b.ts));
   } catch {
     return [];
   }
 }
 
-/** Flag txns as synced. Silently skips ids that no longer exist. */
+/**
+ * True when the stored outbox row is still the one the pusher sent. A `seq`
+ * higher than what we handed out means the row was replaced after the push
+ * left — almost always by a void — and the ack does not apply to it.
+ */
+function ackApplies(row, id) {
+  if (!row) return false;
+  const sent = handedOut.get(id);
+  if (sent === undefined) return true; // never went through getOutbox()
+  return (Number(row.seq) || 0) === sent;
+}
+
+/**
+ * Flag txns as synced. Silently skips ids that no longer exist.
+ *
+ * Skips any row whose outbox entry was superseded after the push: voidTxn()
+ * deliberately sets synced back to 0, and a late ack for the ORIGINAL append
+ * would flip it to 1 and strand the void, unsent, forever.
+ */
 export async function markSynced(ids) {
   const list = [...new Set((Array.isArray(ids) ? ids : []).map(String))].filter(
     Boolean,
@@ -312,49 +411,106 @@ export async function markSynced(ids) {
   if (!list.length) return;
   const db = await openDB();
   if (!db) {
-    const set = new Set(list);
     const data = fbRead();
+    const set = new Set(
+      list.filter((id) =>
+        ackApplies(
+          data.outbox.find((o) => o.id === id),
+          id,
+        ),
+      ),
+    );
     for (const t of data.txns) if (set.has(t.id)) t.synced = 1;
     fbWrite(data);
+    // Deliberately does NOT forget the handed-out seq: sync.js calls
+    // markSynced() and then clearOutbox() for the same ids, and clearOutbox
+    // still needs to know which row was actually pushed.
     return;
   }
   try {
-    const t = db.transaction([TXNS], "readwrite");
+    const t = db.transaction([TXNS, OUTBOX], "readwrite");
     const store = t.objectStore(TXNS);
+    const box = t.objectStore(OUTBOX);
     for (const id of list) {
-      const get = store.get(id);
-      get.onsuccess = () => {
-        const rec = get.result;
-        if (!rec) return;
-        rec.synced = 1;
-        store.put(rec);
+      const cur = box.get(id);
+      cur.onsuccess = () => {
+        if (!ackApplies(cur.result, id)) return;
+        const get = store.get(id);
+        get.onsuccess = () => {
+          const rec = get.result;
+          if (!rec) return;
+          rec.synced = 1;
+          store.put(rec);
+        };
       };
     }
     await txDone(t);
+    // See the fallback branch: clearOutbox() owns forgetting the seq.
   } catch {
     // leave them unsynced — the next push retries
   }
 }
 
-/** Drop ops the server has accepted. */
-export async function clearOutbox(ids) {
+/**
+ * Drop ops the server has accepted.
+ *
+ * Deletes by id ONLY while the stored row is still the one that was pushed.
+ * The race this closes: push an append → user voids the txn (the outbox row
+ * for that id is REPLACED with op:"void") → the ack for the original append
+ * arrives → a blind delete destroys the void, so the row is gone locally and
+ * lives on the server forever. A real deletion silently lost.
+ *
+ * `sync.js` calls this as clearOutbox(ids) and must keep working, so the
+ * guard uses the seq recorded by getOutbox() rather than a new argument.
+ * `expected` is optional and only for callers that tracked rows themselves.
+ *
+ * @param {string[]} ids
+ * @param {Map<string,number>|Object<string,number>} [expected] id -> seq
+ */
+export async function clearOutbox(ids, expected) {
   const list = [...new Set((Array.isArray(ids) ? ids : []).map(String))].filter(
     Boolean,
   );
   if (!list.length) return;
+
+  const want =
+    expected instanceof Map
+      ? expected
+      : expected && typeof expected === "object"
+        ? new Map(Object.entries(expected).map(([k, v]) => [k, Number(v) || 0]))
+        : null;
+  const applies = (row, id) =>
+    want
+      ? row && (Number(row.seq) || 0) <= (want.get(id) ?? -1)
+      : ackApplies(row, id);
+
   const db = await openDB();
   if (!db) {
-    const set = new Set(list);
     const data = fbRead();
-    data.outbox = data.outbox.filter((o) => !set.has(o.id));
+    const kill = new Set(
+      list.filter((id) =>
+        applies(
+          data.outbox.find((o) => o.id === id),
+          id,
+        ),
+      ),
+    );
+    data.outbox = data.outbox.filter((o) => !kill.has(o.id));
     fbWrite(data);
+    for (const id of kill) handedOut.delete(id);
     return;
   }
   try {
     const t = db.transaction([OUTBOX], "readwrite");
     const store = t.objectStore(OUTBOX);
-    for (const id of list) store.delete(id);
+    for (const id of list) {
+      const cur = store.get(id);
+      cur.onsuccess = () => {
+        if (applies(cur.result, id)) store.delete(id);
+      };
+    }
     await txDone(t);
+    for (const id of list) handedOut.delete(id);
   } catch {
     // ops stay queued; re-push is idempotent by id
   }

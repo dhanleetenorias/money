@@ -31,8 +31,16 @@ const KEY_RE = /^(\d{4})-(0[1-9]|1[0-2])$/;
 export function parseAmount(input) {
   if (typeof input === "number") {
     if (!Number.isFinite(input) || input < 0) return null;
-    const cent = Math.round(input * CENT_PER_PESO);
-    return cent > MAX_CENT ? null : cent;
+    // NOT `Math.round(input * 100)`: 1.005 is stored as 1.00499999999999989,
+    // so that rounds DOWN to ₱1.00 and quietly loses a centavo. Render the
+    // number at 15 significant digits (which discards the binary artefact),
+    // trim, and hand it to the string path — so a number with more than two
+    // decimals is rejected exactly like the string "12.345" is.
+    const decimal = input
+      .toPrecision(15)
+      .replace(/(\.\d*?)0+$/, "$1")
+      .replace(/\.$/, "");
+    return parseAmount(decimal);
   }
   if (typeof input !== "string") return null;
 
@@ -217,6 +225,15 @@ function zoned(date, tz = TZ) {
 export function ym(date, tz = TZ) {
   const { y, m } = zoned(date, tz);
   return `${y}-${String(m).padStart(2, "0")}`;
+}
+
+/**
+ * @returns {boolean} true for a well-formed "YYYY-MM".
+ * Callers holding possibly-corrupt stored data should gate on this rather than
+ * catching the RangeError the parsers throw.
+ */
+export function isMonthKey(key) {
+  return typeof key === "string" && KEY_RE.test(key);
 }
 
 function parseKey(key) {

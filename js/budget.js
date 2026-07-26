@@ -18,6 +18,7 @@
 import {
   splitByPct,
   ym,
+  isMonthKey,
   daysInMonth,
   daysLeftInMonth,
   monthProgress,
@@ -74,11 +75,23 @@ function allocOf(month) {
   return Array.isArray(month?.alloc) ? month.alloc : [];
 }
 
+/** True for rows that are bookkeeping or vault draw-downs, never envelope spend. */
+function isNonSpend(kind) {
+  return kind === "sweep" || kind === "withdrawal";
+}
+
 /**
  * Live transactions for this month, keyed by category.
  * 'income' rows subtract (a refund gives budget back); 'sweep' rows are
  * bookkeeping for month close and must not read as spending, or closing a
  * month would look like the whole month was spent twice.
+ *
+ * Withdrawals are excluded BY KIND, not by category. Excluding them by
+ * category id would leak: a withdrawal whose categoryId isn't in this month's
+ * alloc snapshot (vault renamed, or an older month) falls through to
+ * `otherSpent` and silently shrinks safeToSpendToday. Kind is the only
+ * property a withdrawal is guaranteed to carry.
+ *
  * @returns {{byCat:Map<string,number>, vaultSpent:number, otherSpent:number}}
  */
 function spendIndex(month, txns) {
@@ -96,7 +109,7 @@ function spendIndex(month, txns) {
   for (const t of Array.isArray(txns) ? txns : []) {
     if (!t || t.deleted) continue;
     if (key && typeof t.monthKey === "string" && t.monthKey !== key) continue;
-    if (t.kind === "sweep") continue;
+    if (isNonSpend(t.kind)) continue;
     const cent = Number.isFinite(t.cent) ? Math.round(t.cent) : 0;
     if (cent === 0) continue;
     const signed = t.kind === "income" ? -cent : cent;
@@ -109,14 +122,55 @@ function spendIndex(month, txns) {
 }
 
 /**
+ * Sum live withdrawals whose month key passes `accept`.
+ * A withdrawal with no month key is always counted: it left the vault
+ * regardless, and over-counting only makes the withdrawal cap safer.
+ */
+function sumWithdrawals(txns, accept) {
+  let total = 0;
+  for (const t of Array.isArray(txns) ? txns : []) {
+    if (!t || t.deleted || t.kind !== "withdrawal") continue;
+    const key = typeof t.monthKey === "string" ? t.monthKey : "";
+    if (!accept(key)) continue;
+    const cent = Number.isFinite(t.cent) ? Math.round(t.cent) : 0;
+    if (cent > 0) total += cent;
+  }
+  return total;
+}
+
+/**
  * How far through `month` we are, from the perspective of `now`.
  * Past months are complete (1), future months haven't started (0).
+ * A month with an unusable key is treated as complete rather than throwing —
+ * corrupt stored data must degrade, not white-screen the dashboard.
  */
 function progressFor(month, now) {
-  if (!month?.key || now == null) return 1;
-  const cur = ym(now);
+  if (!isMonthKey(month?.key) || now == null) return 1;
+  let cur;
+  try {
+    cur = ym(now);
+  } catch {
+    return 1; // unusable clock — assume the month is done
+  }
   if (month.key === cur) return monthProgress(now);
   return month.key < cur ? 1 : 0;
+}
+
+/**
+ * Days remaining to divide the pool by. The current month uses the real
+ * remainder; any other month uses its full length so browsing history doesn't
+ * divide by a stale "today". A month whose key is missing or corrupt falls
+ * back to 30 rather than throwing — this is reachable from a hand-edited
+ * backup, and a crash here white-screens the dashboard.
+ */
+function remainingDays(month, now) {
+  if (!isMonthKey(month?.key)) return 30;
+  try {
+    if (now != null && month.key === ym(now)) return daysLeftInMonth(now);
+    return daysInMonth(month.key);
+  } catch {
+    return 30;
+  }
 }
 
 function envFrom(entry, spentCent, now, month) {
@@ -171,9 +225,16 @@ export function allEnvelopes(month, txns, now) {
 }
 
 /**
- * @returns {{allocCent, sweptInCent, totalCent, pct, spentCent}} the vault.
+ * This month's contribution to the vault, and what left it this month.
+ *
+ * SCOPE: per-month. `totalCent` is what THIS month added, net of this month's
+ * withdrawals — it is not the balance you can spend from. For that, and for
+ * anything gating a withdraw button, use vaultBalance()/maxWithdrawable().
+ *
  * `sweptInCent` comes from the recorded sweep, not from txns, so it can't
  * drift if a sweep transaction is edited or replayed.
+ *
+ * @returns {{allocCent, sweptInCent, withdrawnCent, totalCent, pct, spentCent}}
  */
 export function vaultState(month, txns) {
   const entries = allocOf(month).filter((a) => a.vault);
@@ -183,13 +244,105 @@ export function vaultState(month, txns) {
   const sweptInCent = Number.isFinite(month?.sweep?.fromCent)
     ? month.sweep.fromCent
     : 0;
+  const key = isMonthKey(month?.key) ? month.key : null;
+  const withdrawnCent = sumWithdrawals(txns, (k) => (key ? k === key : true));
   return {
     allocCent,
     sweptInCent,
+    withdrawnCent,
     spentCent: vaultSpent,
-    totalCent: allocCent + sweptInCent - vaultSpent,
+    // Floored at 0: a month's own line can't read as negative even if someone
+    // withdrew against a balance that earlier months provided.
+    totalCent: Math.max(
+      0,
+      allocCent + sweptInCent - vaultSpent - withdrawnCent,
+    ),
     pct,
   };
+}
+
+/**
+ * The REAL, spendable vault balance: cumulative across every month up to and
+ * including `upToKey`.
+ *
+ * WHY CUMULATIVE. The vault is a savings account, not a monthly envelope. A
+ * birthday in August is paid out of savings built since January, so the only
+ * correct balance is the running total. Capping a withdrawal at one month's
+ * 45% would refuse a ₱2,000 gift against a ₱40,000 balance — wrong, and the
+ * exact failure the per-month view would produce.
+ *
+ * Each month contributes its own allocation plus what its close swept in;
+ * every withdrawal ever made is subtracted. `sweptInCent` is NOT double
+ * counted: a sweep moves money that was allocated to a SPENDABLE envelope, so
+ * it is new to the vault and appears in exactly one month's record.
+ *
+ * @param {object[]|Object<string,object>} months
+ * @param {object[]} txns all txns (any month)
+ * @param {string} [upToKey] inclusive ceiling; omit for the whole history
+ * @returns {{balanceCent, inCent, withdrawnCent, months:number}}
+ */
+export function vaultBalance(months, txns, upToKey) {
+  const list = Array.isArray(months) ? months : Object.values(months || {});
+  const ceiling = isMonthKey(upToKey) ? upToKey : null;
+  const counted = new Set();
+  let inCent = 0;
+
+  for (const m of list) {
+    if (!m || !isMonthKey(m.key)) continue;
+    if (ceiling && m.key > ceiling) continue;
+    if (counted.has(m.key)) continue; // a duplicated record must not pay twice
+    counted.add(m.key);
+    const entries = allocOf(m).filter((a) => a.vault);
+    inCent += entries.reduce((s, a) => s + (a.allocCent || 0), 0);
+    if (Number.isFinite(m.sweep?.fromCent)) inCent += m.sweep.fromCent;
+    // Vault-category expenses are legacy/manual spend; treat like a withdrawal.
+    const { vaultSpent } = spendIndex(m, txns);
+    inCent -= vaultSpent;
+  }
+
+  const withdrawnCent = sumWithdrawals(txns, (k) =>
+    ceiling ? !k || k <= ceiling : true,
+  );
+
+  return {
+    balanceCent: Math.max(0, inCent - withdrawnCent),
+    inCent,
+    withdrawnCent,
+    months: counted.size,
+  };
+}
+
+/**
+ * Ceiling for a withdraw form. The vault may NOT go negative: it represents
+ * money that actually exists, and a negative balance would be a fiction the
+ * sweep would then compound.
+ *
+ * Pass the whole months collection — a single MonthRec is accepted too, but
+ * then the cap is only that month's contribution, which will be too low.
+ *
+ * @param {object[]|Object<string,object>} months
+ * @param {object[]} txns
+ * @param {string} [upToKey]
+ * @returns {number} centavos, never negative
+ */
+export function maxWithdrawable(months, txns, upToKey) {
+  const one = months && !Array.isArray(months) && isMonthKey(months.key);
+  if (one)
+    return vaultBalance([months], txns, upToKey ?? months.key).balanceCent;
+  return vaultBalance(months, txns, upToKey).balanceCent;
+}
+
+/**
+ * Clamp a requested withdrawal to the available balance.
+ * @returns {{cent:number, capped:boolean, availableCent:number}}
+ */
+export function planWithdrawal(months, txns, requestCent, upToKey) {
+  const availableCent = maxWithdrawable(months, txns, upToKey);
+  const want = Number.isFinite(requestCent)
+    ? Math.max(0, Math.round(requestCent))
+    : 0;
+  const cent = Math.min(want, availableCent);
+  return { cent, capped: cent < want, availableCent };
 }
 
 /**
@@ -214,8 +367,7 @@ export function spendablePool(month, txns) {
  */
 export function safeToSpendToday(month, txns, now) {
   const pool = spendablePool(month, txns);
-  const isCurrent = month?.key && now != null && month.key === ym(now);
-  const daysLeft = isCurrent ? daysLeftInMonth(now) : daysInMonth(month.key);
+  const daysLeft = remainingDays(month, now);
   if (pool.leftCent <= 0) return { cent: 0, daysLeft, basis: "zero" };
   return {
     cent: Math.floor(pool.leftCent / daysLeft),
@@ -252,6 +404,11 @@ export function envelopePaceTick(month, now) {
  *
  * Idempotent: once a sweep is recorded on the month, this replays that record
  * instead of recomputing, so closing twice can never double-count.
+ *
+ * Two things it is deliberately blind to: the vault never appears in `byCat`
+ * (it cannot sweep into itself and inflate its own balance), and withdrawals
+ * are dropped upstream by kind — a birthday paid from savings during the
+ * closing month must not shrink that month's leftovers.
  * @returns {{fromCent:number, byCat:Object<string,number>, toVaultCent:number}}
  */
 export function computeSweep(month, txns) {
@@ -284,9 +441,19 @@ export function computeSweep(month, txns) {
  */
 export function monthsToClose(months, now) {
   const list = Array.isArray(months) ? months : Object.values(months || {});
-  const cur = now == null ? null : ym(now);
+  let cur = null;
+  if (now != null) {
+    try {
+      cur = ym(now);
+    } catch {
+      // Unusable clock: close nothing rather than sweeping on a guess.
+      return [];
+    }
+  }
+  // isMonthKey, not typeof string: a corrupt key would sort into the queue and
+  // then throw in daysInMonth() the moment the close ran.
   return list
-    .filter((m) => m && typeof m.key === "string" && !m.closedAt)
+    .filter((m) => m && isMonthKey(m.key) && !m.closedAt)
     .filter((m) => cur == null || m.key < cur)
     .map((m) => m.key)
     .sort();

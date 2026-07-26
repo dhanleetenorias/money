@@ -16,6 +16,7 @@ import {
   dayOfMonth,
   daysLeftInMonth,
   monthProgress,
+  isMonthKey,
   uid,
 } from "../js/money.js";
 
@@ -72,6 +73,26 @@ test("parseAmount: rejects junk", () => {
       `should reject ${JSON.stringify(bad)}`,
     );
   }
+});
+
+test("F6 parseAmount: number input obeys the same rules as string input", () => {
+  // RULING: a number with more than 2 decimals is REJECTED, exactly as the
+  // string "12.345" is. Previously these went down a separate branch that did
+  // Math.round(x * 100) — and 1.005 is stored as 1.00499999999999989, so it
+  // silently rounded DOWN to ₱1.00, losing a centavo with no error.
+  assert.equal(parseAmount(1.005), null);
+  assert.equal(parseAmount(8.615), null);
+  assert.equal(parseAmount(180.555), null);
+  assert.equal(parseAmount("180.555"), null);
+
+  // Legitimate values still work, and the binary representation of a value
+  // with <=2 real decimals must not leak into the result.
+  assert.equal(parseAmount(180), 18000);
+  assert.equal(parseAmount(1234.5), 123450);
+  assert.equal(parseAmount(0.07), 7);
+  assert.equal(parseAmount(0.1 + 0.2), 30); // 0.30000000000000004
+  assert.equal(parseAmount(1e9), 1e11);
+  assert.equal(parseAmount(0), 0);
 });
 
 test("parseAmount: rejects absurd magnitudes but keeps the ceiling", () => {
@@ -163,15 +184,28 @@ test("splitByPct: edge incomes", () => {
 });
 
 test("splitByPct: deterministic tie-break — higher pct, then lower index", () => {
-  // Three equal thirds of 100c: remainder 1 goes to index 0.
-  const a = splitByPct(100, [33.333333, 33.333333, 33.333333]);
-  assert.equal(sum(a), 100);
-  assert.deepEqual(a, splitByPct(100, [33.333333, 33.333333, 33.333333]));
-  assert.equal(a[0], Math.max(...a));
+  // Literal expectations, not a comparison against another call: asserting
+  // f(x) === f(x) is a tautology that passes for ANY implementation.
+  // 100c in three equal thirds: 33/33/33 + a remainder centavo to index 0.
+  assert.deepEqual(
+    splitByPct(100, [33.333333, 33.333333, 33.333333]),
+    [34, 33, 33],
+  );
 
-  // Equal remainders but unequal pcts: the bigger envelope wins the centavo.
-  const b = splitByPct(7, [50, 50]);
-  assert.deepEqual(b, [4, 3]);
+  // Equal remainders, unequal pcts: the bigger envelope wins the centavo.
+  assert.deepEqual(splitByPct(7, [50, 50]), [4, 3]);
+  assert.deepEqual(splitByPct(10, [25, 75]), [2, 8]);
+
+  // Two centavos over three equal shares go to the two lowest indices.
+  assert.deepEqual(
+    splitByPct(101, [33.333333, 33.333333, 33.333333]),
+    [34, 34, 33],
+  );
+
+  // Order of the pcts drives the result — the same multiset reversed puts the
+  // remainder somewhere else, which pins that it isn't index-agnostic.
+  assert.deepEqual(splitByPct(1, [1, 99]), [0, 1]);
+  assert.deepEqual(splitByPct(1, [99, 1]), [1, 0]);
 });
 
 test("splitByPct: degenerate inputs never lose money", () => {
@@ -232,6 +266,28 @@ test("ym: accepts epoch ms as well as Date", () => {
 test("ym: throws on an invalid date rather than mis-filing money", () => {
   assert.throws(() => ym(new Date("nope")));
   assert.throws(() => ym("not a date"));
+});
+
+test("isMonthKey guards every stored key", () => {
+  for (const good of ["2026-07", "2026-01", "2026-12", "1999-05"]) {
+    assert.equal(isMonthKey(good), true, good);
+  }
+  for (const bad of [
+    "2026-13",
+    "2026-00",
+    "2026-7",
+    "26-07",
+    "2026/07",
+    "2026-07-15",
+    "",
+    " 2026-07",
+    null,
+    undefined,
+    202607,
+    {},
+  ]) {
+    assert.equal(isMonthKey(bad), false, JSON.stringify(bad));
+  }
 });
 
 test("ymPrev / ymNext wrap years", () => {
