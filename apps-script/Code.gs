@@ -46,7 +46,10 @@ var TZ = "Asia/Manila";
  *
  *   A Date        yyyy-MM-dd (Manila)      — what day the money moved
  *   B Time        HH:mm (Manila)
- *   C Type        expense | income | sweep | void
+ *   C Type        expense | income | sweep | withdrawal | void
+ *                 withdrawal = money taken back out of Save/Invest (a gift,
+ *                 a one-off). NOT envelope spending — don't sum it with
+ *                 expenses or you double-count.
  *   D Category    display name ("Food")
  *   E Amount      SIGNED pesos, 2dp — expenses negative, so a plain SUM works
  *   F Note        free text
@@ -187,7 +190,12 @@ function writeOps(ops) {
 
     var isVoid = String(op.op) === "void";
     var kind = String(op.kind || "expense");
-    if (kind !== "income" && kind !== "sweep" && kind !== "expense") {
+    if (
+      kind !== "income" &&
+      kind !== "sweep" &&
+      kind !== "withdrawal" &&
+      kind !== "expense"
+    ) {
       kind = "expense";
     }
 

@@ -70,6 +70,9 @@ import {
 } from "./store.js";
 
 /** Ops per HTTP request. Apps Script is slow per-call; one setValues per batch. */
+/** Kinds that may reach the sheet verbatim. Anything else lands as "expense". */
+const WIRE_KINDS = new Set(["income", "sweep", "withdrawal"]);
+
 const BATCH = 50;
 
 /** Batches per drain (50 × 20 = 1000 ops) — a hard stop against a spin loop. */
@@ -201,7 +204,10 @@ function toWire(rec) {
         ? rec.ts
         : Date.now(),
     monthKey: String(txn.monthKey ?? ""),
-    kind: txn.kind === "income" || txn.kind === "sweep" ? txn.kind : "expense",
+    // Whitelist, so a new kind can't silently reach the sheet as "expense".
+    // A withdrawal mislabelled as spending would double-count against the
+    // envelopes in any spreadsheet analysis.
+    kind: WIRE_KINDS.has(txn.kind) ? txn.kind : "expense",
     categoryId: String(txn.categoryId ?? ""),
     category: categoryName(String(txn.categoryId ?? "")),
     cent: signedCent(txn, wireOp),
