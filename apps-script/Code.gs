@@ -9,13 +9,37 @@
  *      (Running Cash, Starting Cash, Total Income, Total Spent, Cash Left) and
  *      column K holds an older category dropdown with a different taxonomy.
  *      Appending app rows there corrupts both. We own `App Log` and nothing else.
- *   2. APPEND-ONLY. A void is a compensating negative row, never an edit or a
- *      delete. That keeps the sheet an audit log you can reconstruct.
+ *   2. APPEND-ONLY, WITH ONE EXCEPTION. A void is a compensating negative row,
+ *      never an edit or a delete — that keeps the sheet reconstructible. The
+ *      exception is op:"update", which rewrites one row in place; see below.
  *   3. IDEMPOTENT by txn id. A phone that retries after a flaky response must
  *      not double a row. Ids already present are skipped but still returned in
  *      `accepted`, so the client clears them from its outbox.
- *   4. ONE setValues() per request. Per-row appendRow() is ~1s each and times
- *      out the execution on a real backlog.
+ *   4. ONE setValues() per request for appends. Per-row appendRow() is ~1s each
+ *      and times out the execution on a real backlog. Updates are per-row
+ *      writes by necessity (they target scattered rows), which is why the
+ *      client only ever sends a handful.
+ *
+ * THE `update` OP — the only non-append-only path
+ *   The user edited an amount / category / note / date on a row that is
+ *   already in the sheet. A compensating pair (void + re-append) was the
+ *   append-only alternative and it was rejected: it doubles the row count for
+ *   an ordinary typo fix and makes the log unreadable to a human, which is the
+ *   point of the log.
+ *
+ *   `kind` is NOT editable client-side, so an update can never move money
+ *   between the vault and the spendable pool — it only ever restates the same
+ *   kind. Column C is rewritten from the op anyway, for consistency.
+ *
+ *   NOT FOUND FALLS BACK TO APPEND. A phone can edit a txn whose original
+ *   append never landed (offline when it was created, edited before the first
+ *   successful sync). Silently doing nothing would lose that row forever, so
+ *   an unmatched id is appended as a normal row.
+ *
+ *   Updates take the same LockService lock as appends. Two executions each
+ *   reading the row map before the other wrote would otherwise let one
+ *   overwrite the other's row, or let an append land at a row number a
+ *   concurrent update had just claimed.
  *
  * REQUEST (POST body is a JSON string, sent as text/plain to dodge the CORS
  * preflight that Apps Script cannot answer — see js/sync.js):
@@ -23,17 +47,21 @@
  *     v: 1,
  *     token: "<shared secret>",
  *     ops: [{
- *       id, op:"append"|"void", ts, monthKey, kind, categoryId,
+ *       id, op:"append"|"void"|"update", ts, monthKey, kind, categoryId,
  *       category, cent, note
  *     }]
  *   }
  *
  * RESPONSE:
- *   { ok:true, accepted:[id], duplicates:[id], rejected:[{id,err}], rows:N }
+ *   { ok:true, accepted:[id], duplicates:[id], rejected:[{id,err}],
+ *     rows:N, updated:M }
  *   { ok:false, err:"auth"|"badjson"|"badops"|"toolarge"|"busy"|"unconfigured" }
  *
- * `accepted` is the union of newly-written and already-present ids: both are
- * safe for the client to clear. `duplicates` is informational only.
+ * `accepted` is the union of newly-written, updated-in-place and
+ * already-present ids: all are safe for the client to clear. `duplicates` is
+ * informational only, and an `update` is NEVER reported as a duplicate — the
+ * whole point is that it rewrites the row it matched. `rows` counts appended
+ * rows, `updated` counts rows rewritten in place.
  */
 
 var SHEET_NAME = "App Log";
@@ -148,9 +176,12 @@ function doGet() {
 
 function writeOps(ops) {
   var sheet = getLogSheet();
-  var existing = readIdSet(sheet);
+  // id -> 1-based row number. Presence in this map is the "already in the
+  // sheet" test that readIdSet used to answer, so one read serves both.
+  var rowById = readIdRows(sheet);
 
-  var rows = [];
+  var rows = []; // appended in one batch at the end
+  var updates = []; // {row, values} — rewritten in place
   var accepted = [];
   var duplicates = [];
   var rejected = [];
@@ -161,15 +192,25 @@ function writeOps(ops) {
   var now = new Date();
   var syncedAt = Utilities.formatDate(now, TZ, "yyyy-MM-dd HH:mm:ss");
 
+  // Where the next appended row will land. Tracked rather than re-read so an
+  // update that follows an append in the SAME batch can find that append's
+  // row number. getLastRow() is read inside the lock, so it cannot race.
+  var appendStart = sheet.getLastRow() + 1;
+  var nextRow = appendStart;
+
   for (var i = 0; i < ops.length; i++) {
     var op = ops[i] || {};
     var id = String(op.id == null ? "" : op.id);
+    var isUpdate = String(op.op) === "update";
 
     if (!id) {
       rejected.push({ id: "", err: "noid" });
       continue;
     }
-    if (existing[id] === true || seen[id] === true) {
+
+    // An update is NEVER a duplicate: rewriting the row it matched is the
+    // whole point. Only appends and voids dedupe by id.
+    if (!isUpdate && (rowById[id] != null || seen[id] != null)) {
       // Already in the sheet (or earlier in this payload). Report it as
       // accepted so the phone stops resending it — this is the retry-safety.
       duplicates.push(id);
@@ -202,7 +243,7 @@ function writeOps(ops) {
     var note = String(op.note == null ? "" : op.note);
     if (isVoid) note = note ? "VOID — " + note : "VOID";
 
-    rows.push([
+    var values = [
       Utilities.formatDate(when, TZ, "yyyy-MM-dd"),
       Utilities.formatDate(when, TZ, "HH:mm"),
       isVoid ? "void" : kind,
@@ -213,17 +254,41 @@ function writeOps(ops) {
       String(op.categoryId == null ? "" : op.categoryId),
       id,
       syncedAt,
-    ]);
+    ];
 
-    seen[id] = true;
+    // seen[id] carries the row this batch put the id on: a real row number for
+    // an append, so a later update in the same payload can target it.
+    if (isUpdate) {
+      var target = rowById[id] != null ? rowById[id] : seen[id];
+      if (target != null) {
+        updates.push({ row: target, values: values });
+        accepted.push(id);
+        continue;
+      }
+      // NOT FOUND → fall through and APPEND. The original append never
+      // landed; doing nothing here would lose the row permanently.
+    }
+
+    rows.push(values);
+    seen[id] = nextRow;
+    rowById[id] = nextRow;
+    nextRow += 1;
     accepted.push(id);
   }
 
   if (rows.length) {
-    // ONE write for the whole batch. getLastRow() is read inside the lock, so
-    // it cannot race another execution.
-    var start = sheet.getLastRow() + 1;
-    sheet.getRange(start, 1, rows.length, NUM_COLS).setValues(rows);
+    // ONE write for the whole append batch, at the row number the loop already
+    // handed out — re-reading getLastRow() here would disagree with the row
+    // numbers recorded in `seen`.
+    sheet.getRange(appendStart, 1, rows.length, NUM_COLS).setValues(rows);
+  }
+
+  // Updates target scattered rows, so they cannot share a setValues(). The
+  // client sends edits one at a time, so this loop is short in practice.
+  for (var u = 0; u < updates.length; u++) {
+    sheet
+      .getRange(updates[u].row, 1, 1, NUM_COLS)
+      .setValues([updates[u].values]);
   }
 
   return {
@@ -232,6 +297,7 @@ function writeOps(ops) {
     duplicates: duplicates,
     rejected: rejected,
     rows: rows.length,
+    updated: updates.length,
   };
 }
 
@@ -257,17 +323,41 @@ function getLogSheet() {
 }
 
 /**
- * Existing txn ids as a lookup map. Reads ONE column, which is why the id
- * lives in its own column — pulling the whole grid would be far slower.
+ * Existing txn ids -> their 1-BASED ROW NUMBER. Reads ONE column, which is why
+ * the id lives in its own column — pulling the whole grid would be far slower.
+ *
+ * Returns row numbers rather than a presence flag so an `update` can rewrite
+ * its row with a single getRange(row, 1, 1, NUM_COLS).setValues([...]). A
+ * non-null entry still answers "is this id already in the sheet", which is all
+ * the append path needs.
+ *
+ * A void appends a SECOND row carrying the same id, so an id can legitimately
+ * appear more than once. The map keeps the LAST occurrence: for the append
+ * path any occurrence proves presence, and for an update the newest row is the
+ * one the user is looking at. (An update to a voided txn is refused client-
+ * side anyway — idb.updateTxn rejects a tombstoned record.)
  */
-function readIdSet(sheet) {
-  var set = {};
+function readIdRows(sheet) {
+  var map = {};
   var last = sheet.getLastRow();
-  if (last < 2) return set;
+  if (last < 2) return map;
   var values = sheet.getRange(2, ID_COL, last - 1, 1).getValues();
   for (var i = 0; i < values.length; i++) {
     var id = values[i][0];
-    if (id !== "" && id != null) set[String(id)] = true;
+    if (id !== "" && id != null) map[String(id)] = i + 2; // +2: header + 0-based
+  }
+  return map;
+}
+
+/**
+ * Back-compat shim: the presence set the append path used before row numbers
+ * were needed. Kept so a hand-run of an older helper in the editor still works.
+ */
+function readIdSet(sheet) {
+  var rows = readIdRows(sheet);
+  var set = {};
+  for (var id in rows) {
+    if (Object.prototype.hasOwnProperty.call(rows, id)) set[id] = true;
   }
   return set;
 }

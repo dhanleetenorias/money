@@ -40,10 +40,10 @@
  *     token: "<shared secret>",
  *     ops: [{
  *       id:         "uuid",                 // idempotency key = the txn id
- *       op:         "append" | "void",
+ *       op:         "append" | "void" | "update",
  *       ts:         1753600000000,          // epoch ms; server formats in Manila
  *       monthKey:   "2026-07",
- *       kind:       "expense"|"income"|"sweep",
+ *       kind:       "expense"|"income"|"sweep"|"withdrawal",
  *       categoryId: "food",
  *       category:   "Food",                 // display name, best effort
  *       cent:       -18000,                 // SIGNED centavos, see signedCent()
@@ -58,6 +58,14 @@
  * `accepted` is authoritative and INCLUDES ids the server already had (a
  * duplicate is a success from the client's point of view — the row is in the
  * sheet). We only ever clear ids the SERVER named, never the ids we sent.
+ *
+ * `update` is the one op that is NOT append-only: the server finds the row by
+ * TxnId and rewrites it in place, falling back to an append when the id is
+ * absent (a phone can edit a txn whose original append never landed). It
+ * therefore carries the txn's CURRENT values under its EXISTING id — the same
+ * shape as an append, only the verb differs. It is never sent as `append`,
+ * because the server dedupes appends by id and a landed original would keep
+ * the stale numbers.
  */
 
 import { getOutbox, markSynced, clearOutbox } from "./idb.js";
@@ -174,6 +182,8 @@ function scheduleRetry() {
  * a spreadsheet wants something you can SUM.
  *   expense → negative, income → positive, sweep → positive (into savings)
  *   void    → the exact negation of the row it compensates
+ *   update  → the same sign rule as an append: it REPLACES the row rather
+ *             than compensating it, so it must not be negated.
  */
 function signedCent(txn, wireOp) {
   const cent = Number.isFinite(txn?.cent) ? Math.round(txn.cent) : 0;
@@ -191,10 +201,24 @@ function categoryName(id) {
   }
 }
 
-/** outbox record {id, op:'put'|'void', ts, txn} → wire op. */
+/**
+ * Local outbox verb → wire verb. The local vocabulary is 'put'|'void'|
+ * 'update'; the wire is 'append'|'void'|'update'. Anything unrecognised
+ * degrades to 'append', which the server dedupes by id — a safe default,
+ * because at worst it re-sends a row that is already there.
+ *
+ * A Map, not an object literal: a plain object would resolve 'constructor' or
+ * 'toString' off Object.prototype and put a FUNCTION in the `op` field.
+ */
+const WIRE_OPS = new Map([
+  ["void", "void"],
+  ["update", "update"],
+]);
+
+/** outbox record {id, op:'put'|'void'|'update', ts, txn} → wire op. */
 function toWire(rec) {
   const txn = rec?.txn || {};
-  const wireOp = rec?.op === "void" ? "void" : "append";
+  const wireOp = WIRE_OPS.get(rec?.op) || "append";
   return {
     id: String(rec?.id ?? ""),
     op: wireOp,

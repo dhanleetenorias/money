@@ -15,8 +15,16 @@
  * alternative is losing an expense the user already believes is recorded.
  *
  * txn = {id, monthKey, ts, cent, categoryId, note,
- *        kind:'expense'|'income'|'sweep', synced:0|1, deleted:0}
+ *        kind:'expense'|'income'|'sweep'|'withdrawal', synced:0|1, deleted:0}
+ *
+ * Outbox verbs are 'put' (append), 'void' (tombstone) and 'update' (edit an
+ * existing row). Because the outbox is keyed by txn id there is at most ONE
+ * row per txn: a later verb REPLACES an earlier one rather than queueing
+ * behind it, and `seq` records how many times that has happened.
+ * sync.js maps these to the wire verbs — see its toWire().
  */
+
+import { ym } from "./money.js";
 
 const DB_NAME = "money";
 const DB_VERSION = 1;
@@ -226,6 +234,214 @@ export async function addTxn(txn) {
     fbPut(rec, "put");
   }
   return rec;
+}
+
+/**
+ * Fields a user may edit. `kind` is deliberately NOT here — see planUpdate().
+ * `monthKey` is not here either: it is DERIVED from `ts`, never set directly,
+ * so the Month column can never disagree with the Date column.
+ */
+const EDITABLE = ["cent", "categoryId", "note", "ts"];
+
+/**
+ * Pure half of updateTxn: validate a patch against a stored record and return
+ * the record it should become. No storage, so both the IndexedDB and the
+ * localStorage paths run byte-identical rules.
+ *
+ * @param {object|undefined} rec  the stored txn
+ * @param {object} patch          {cent?, categoryId?, note?, ts?}
+ * @param {(monthKey:string)=>boolean} isClosed
+ * @returns {{ok:true, rec:object, changed:boolean}|{ok:false, error:string, monthKey?:string}}
+ */
+function planUpdate(rec, patch, isClosed) {
+  if (!rec) return { ok: false, error: "notfound" };
+  // A tombstoned row is not editable: the server has already been told to
+  // reverse it, and re-editing it would resurrect money the user removed.
+  if (rec.deleted === 1) return { ok: false, error: "deleted" };
+
+  const closed = (key) => {
+    try {
+      return isClosed(String(key)) === true;
+    } catch {
+      // A throwing guard is treated as CLOSED. Refusing an edit costs the user
+      // one retry; allowing one desyncs the vault silently.
+      return true;
+    }
+  };
+
+  // Source month first — a closed month refuses every edit, whatever it asks.
+  if (closed(rec.monthKey)) {
+    return { ok: false, error: "closed", monthKey: rec.monthKey };
+  }
+
+  const p = patch && typeof patch === "object" ? patch : {};
+
+  /**
+   * RULING ON `kind`: a patch that CHANGES kind is REFUSED, a patch that
+   * merely restates the current kind is ignored.
+   *
+   * Silently dropping a changed kind was the alternative and it is worse: the
+   * caller sees ok:true, believes the expense is now a withdrawal, and the
+   * ₱ quietly stays on the wrong side of the vault boundary. Refusing is loud.
+   * Tolerating an unchanged kind keeps the natural UI idiom — passing the
+   * whole txn back with one field swapped — from being a footgun.
+   */
+  if (p.kind !== undefined && String(p.kind) !== rec.kind) {
+    return { ok: false, error: "kind" };
+  }
+
+  const next = { ...rec };
+
+  if (p.cent !== undefined) {
+    const cent = toInt(p.cent);
+    // Unlike addTxn, junk is NOT coerced to 0 here. addTxn's 0 preserves a row
+    // the user believes exists; an edit has an original to fall back on, so
+    // refusing beats overwriting a real amount with nothing.
+    if (cent === null) return { ok: false, error: "amount" };
+    next.cent = cent;
+  }
+  if (p.categoryId !== undefined) next.categoryId = String(p.categoryId ?? "");
+  if (p.note !== undefined) {
+    next.note = typeof p.note === "string" ? p.note : String(p.note ?? "");
+  }
+  if (p.ts !== undefined) {
+    const ts = toInt(p.ts);
+    if (ts === null) return { ok: false, error: "date" };
+    next.ts = ts;
+    if (ts !== rec.ts) {
+      // Moving the date across a month boundary MUST move the month key, or
+      // the txn keeps spending a month it no longer belongs to. Only on an
+      // actual change, so a legacy row with a mismatched key isn't silently
+      // re-filed by an edit that never touched the date.
+      try {
+        next.monthKey = ym(ts);
+      } catch {
+        // Unusable date — keep the existing key rather than guess.
+      }
+    }
+  }
+
+  // Destination month, when the edit moves the txn out of its month.
+  if (next.monthKey !== rec.monthKey && closed(next.monthKey)) {
+    return { ok: false, error: "closed", monthKey: next.monthKey };
+  }
+
+  const changed =
+    EDITABLE.some((f) => next[f] !== rec[f]) || next.monthKey !== rec.monthKey;
+
+  // A patch that asks for nothing new writes nothing: no outbox row, and the
+  // synced flag left exactly as it was. Otherwise a UI that saves on every
+  // keystroke would re-queue an op — and un-sync the row — for no reason.
+  if (!changed) return { ok: true, rec: { ...rec }, changed: false };
+
+  // The local copy no longer matches the sheet, exactly as voidTxn does.
+  // Leaving synced:1 would let the row be filtered out of a future re-push.
+  next.synced = 0;
+  return { ok: true, rec: next, changed: true };
+}
+
+/**
+ * Edit an existing transaction: amount, category, note, date.
+ *
+ * ─────────────────────────────────────────────────────────────────────────
+ * CONTRACT FOR THE CALLER (read this before wiring the UI)
+ *
+ * `opts.isClosed` is REQUIRED. idb.js cannot import store.js, so it cannot
+ * ask whether a month has been swept — the caller supplies the predicate:
+ *
+ *     idb.updateTxn(id, patch, {
+ *       isClosed: (key) => !!store.getMonth(key)?.closedAt,
+ *     })
+ *
+ * Omitting it returns {ok:false, error:"guard"} rather than defaulting to
+ * "open". A missing guard is a programming mistake and shows up as an edit
+ * that visibly refuses; the fail-open alternative shows up as a vault balance
+ * that is wrong by an amount nobody can trace. The month close BANKED a
+ * figure computed from that month's transactions, so changing one afterwards
+ * desyncs the vault. Reopening is deliberate and separate: store.reopenMonth
+ * (and main.js's reopenMonthForEdit, which also reverses the sweep row).
+ *
+ * Both the source AND destination month are checked, because editing the date
+ * can move a txn between months.
+ *
+ * The result MUST be respected — this function never throws and never
+ * partially applies. On ok:false nothing was written.
+ * ─────────────────────────────────────────────────────────────────────────
+ *
+ * OUTBOX: exactly ONE row per txn id, always. An edit REPLACES whatever was
+ * queued for that id with a single op:"update" carrying the current values —
+ * it never adds a second row, so two rapid edits collapse to one op with the
+ * final numbers.
+ *
+ * It stays "update" even when the pending row was an un-pushed op:"put".
+ * Rewriting it back to "put" looks tidier and is wrong: `handedOut` is memory
+ * only, so after a reload we cannot know whether that append already reached
+ * the sheet, and the server dedupes "put" by id — a landed append would keep
+ * the STALE values and the edit would vanish. Code.gs's "update" rewrites the
+ * row in place and falls back to appending when the id is absent, so it is
+ * correct in both worlds. One op either way.
+ *
+ * Like voidTxn, this deliberately does NOT call forgetHandedOut(): leaving the
+ * OLD seq in place is exactly what makes a late ack for the superseded append
+ * mismatch and get refused, instead of clearing this update away.
+ *
+ * @param {string} id
+ * @param {{cent?:number|string, categoryId?:string, note?:string, ts?:number}} patch
+ * @param {{isClosed:(monthKey:string)=>boolean}} opts
+ * @returns {Promise<{ok:true, txn:object, changed:boolean}
+ *                  |{ok:false, error:"guard"|"notfound"|"deleted"|"kind"
+ *                            |"amount"|"date"|"closed"|"storage",
+ *                    monthKey?:string}>} Never rejects.
+ */
+export async function updateTxn(id, patch, opts = {}) {
+  const key = String(id ?? "");
+  const isClosed = typeof opts?.isClosed === "function" ? opts.isClosed : null;
+  if (!isClosed) return { ok: false, error: "guard" };
+  if (!key) return { ok: false, error: "notfound" };
+
+  const db = await openDB();
+
+  if (!db) {
+    const data = fbRead();
+    const plan = planUpdate(
+      data.txns.find((t) => t && t.id === key),
+      patch,
+      isClosed,
+    );
+    if (!plan.ok) return plan;
+    // A no-op edit must not dirty the outbox or clear the synced flag.
+    if (!plan.changed) return { ok: true, txn: plan.rec, changed: false };
+    fbPut(plan.rec, "update");
+    return { ok: true, txn: plan.rec, changed: true };
+  }
+
+  try {
+    const out = { plan: null };
+    const t = db.transaction([TXNS, OUTBOX], "readwrite");
+    const store = t.objectStore(TXNS);
+    const box = t.objectStore(OUTBOX);
+    // Callback style, as in voidTxn: awaiting between the get and the put can
+    // let the transaction auto-commit before the write lands.
+    const get = store.get(key);
+    get.onsuccess = () => {
+      const plan = planUpdate(get.result, patch, isClosed);
+      out.plan = plan;
+      if (!plan.ok || !plan.changed) return;
+      store.put(plan.rec);
+      const prev = box.get(key);
+      prev.onsuccess = () =>
+        box.put(opFor(plan.rec, "update", prev.result?.seq));
+    };
+    await txDone(t);
+    if (!out.plan) return { ok: false, error: "notfound" };
+    if (!out.plan.ok) return out.plan;
+    return { ok: true, txn: out.plan.rec, changed: out.plan.changed };
+  } catch {
+    // Unlike addTxn we cannot fall back to localStorage: the record lives in
+    // IndexedDB and the fallback store has never seen it. Report the failure
+    // instead — the original txn stands untouched, so no money is lost.
+    return { ok: false, error: "storage" };
+  }
 }
 
 /**

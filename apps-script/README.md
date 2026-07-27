@@ -130,20 +130,76 @@ Delete the test row from `App Log` by hand when you're done.
 
 ## App Log columns
 
-| Col | Field      | Notes                                                      |
-| --- | ---------- | ---------------------------------------------------------- |
-| A   | Date       | `yyyy-MM-dd`, Asia/Manila                                  |
-| B   | Time       | `HH:mm`, Asia/Manila                                       |
-| C   | Type       | `expense` / `income` / `sweep` / `void`                    |
-| D   | Category   | display name, e.g. `Food`                                  |
-| E   | Amount     | **signed pesos** — expenses negative, so `SUM(E:E)` is net |
-| F   | Note       | free text; a void is prefixed `VOID — `                    |
-| G   | Month      | month key, `2026-07`                                       |
-| H   | CategoryId | stable id, survives a rename                               |
-| I   | TxnId      | idempotency key — read back as a single column             |
-| J   | SyncedAt   | server-side write time, Manila                             |
+| Col | Field      | Notes                                                        |
+| --- | ---------- | ------------------------------------------------------------ |
+| A   | Date       | `yyyy-MM-dd`, Asia/Manila                                    |
+| B   | Time       | `HH:mm`, Asia/Manila                                         |
+| C   | Type       | `expense` / `income` / `sweep` / `withdrawal` / `void`       |
+| D   | Category   | display name, e.g. `Food`                                    |
+| E   | Amount     | **signed pesos** — expenses negative, so `SUM(E:E)` is net   |
+| F   | Note       | free text; a void is prefixed `VOID — `                      |
+| G   | Month      | month key, `2026-07`                                         |
+| H   | CategoryId | stable id, survives a rename                                 |
+| I   | TxnId      | idempotency key **and update key** — read back as one column |
+| J   | SyncedAt   | server-side write time, Manila                               |
 
-Append-only. A void never edits or deletes the original row; it appends a
-compensating row with the opposite sign, so the sheet stays an audit trail.
-Never add a formula to a whole column here — the script writes ranges directly
-and a spilled formula would be overwritten.
+Append-only, with one exception. A void never edits or deletes the original
+row; it appends a compensating row with the opposite sign, so the sheet stays
+an audit trail. Never add a formula to a whole column here — the script writes
+ranges directly and a spilled formula would be overwritten.
+
+## The `update` op
+
+> **This op requires a NEW DEPLOYMENT VERSION.** `update` was added to
+> `Code.gs` after the original deploy, so an app that sends one to an old
+> deployment gets the row appended a second time (the old code treats an
+> unknown verb as an append) instead of edited in place. Re-paste `Code.gs`
+> and publish a new version — see "Re-deploying after an edit" above.
+
+`op:"update"` is the **only** operation that rewrites an existing row. The user
+edited a transaction's amount, category, note or date; a compensating
+void-plus-re-append would have kept the log strictly append-only but doubles
+the row count for an ordinary typo fix.
+
+- The row is found **by TxnId (column I)** and rewritten in place with a single
+  `setValues`, holding the same `LockService` lock as the append path.
+- `kind` is **not** editable in the app, so an update can never move money
+  between the Save/Invest vault and the spendable envelopes.
+- **An id that is not found is APPENDED**, not skipped. A phone can edit a
+  transaction whose original append never landed (created offline, edited
+  before the first successful sync) and that row must still reach the sheet.
+- An update is never reported in `duplicates` — matching an existing row is the
+  point, not a reason to skip.
+
+The success response therefore carries one extra field:
+
+```json
+{
+  "ok": true,
+  "accepted": ["id"],
+  "duplicates": [],
+  "rejected": [],
+  "rows": 0,
+  "updated": 1
+}
+```
+
+`rows` counts newly appended rows, `updated` counts rows rewritten in place.
+Both kinds of id appear in `accepted`, which is what the client clears.
+
+Verify an update with curl — run the append from "Testing with curl" first,
+then:
+
+```sh
+curl -sL -X POST 'PASTE_EXEC_URL_HERE' \
+  -H 'Content-Type: text/plain;charset=utf-8' \
+  -d '{"v":1,"token":"PASTE_TOKEN_HERE","ops":[{
+        "id":"curl-test-1","op":"update","ts":1753600000000,
+        "monthKey":"2026-07","kind":"expense","categoryId":"food",
+        "category":"Food","cent":-25000,"note":"edited"}]}'
+```
+
+Expected: `"accepted":["curl-test-1"],"rows":0,"updated":1`, and the single
+existing `curl-test-1` row now reads `Food / -250.00 / edited` — with **no**
+second row added. Send the same op with an id that does not exist and you
+should get `"rows":1,"updated":0` instead.
