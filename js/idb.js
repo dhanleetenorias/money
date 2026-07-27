@@ -237,11 +237,67 @@ export async function addTxn(txn) {
 }
 
 /**
+ * Serialises updateTxn per txn id.
+ *
+ * HONEST SCOPE: this does not fix an observed loss. Today the fallback path
+ * has NO await between its fbRead and its fbWrite, so concurrent calls resume
+ * from `await openDB()` in FIFO order and each read-plan-write runs to
+ * completion — I could not make two edits lose a field. The IndexedDB path is
+ * safe for a stronger reason: the whole thing is one transaction.
+ *
+ * It is here because that safety rests entirely on an accident of where the
+ * awaits sit. Add one await anywhere between the read and the write — an async
+ * guard, a quota check, a metric — and two edits silently plan from the same
+ * snapshot, and the second erases the first one's field. That failure is
+ * invisible: the user watches both saves succeed. Chaining per id makes the
+ * invariant structural instead of incidental.
+ *
+ * Keyed per id rather than globally, so an edit to one txn never waits on an
+ * unrelated one. The entry is deleted when the last waiter drains.
+ */
+const updateChain = new Map();
+
+function serialiseUpdate(id, run) {
+  const prev = updateChain.get(id) || Promise.resolve();
+  // Swallow the predecessor's outcome: updateTxn never rejects, but a chain
+  // that adopted a rejection would poison every later edit to the same txn.
+  const next = prev.then(run, run);
+  updateChain.set(id, next);
+  // Only clear if nothing else queued behind us in the meantime.
+  const done = () => {
+    if (updateChain.get(id) === next) updateChain.delete(id);
+  };
+  next.then(done, done);
+  return next;
+}
+
+/**
  * Fields a user may edit. `kind` is deliberately NOT here — see planUpdate().
  * `monthKey` is not here either: it is DERIVED from `ts`, never set directly,
  * so the Month column can never disagree with the Date column.
  */
 const EDITABLE = ["cent", "categoryId", "note", "ts"];
+
+/**
+ * Kinds whose amount is load-bearing elsewhere and therefore not editable.
+ *
+ * A `sweep` row's figure is banked separately as month.sweep.fromCent, which
+ * vaultBalance reads and which no edit touches — so editing the row desyncs
+ * the vault by the difference, invisibly. Reversing a sweep is what
+ * reopenMonth is for.
+ */
+const UNEDITABLE_KINDS = new Set(["sweep"]);
+
+/**
+ * Sanity window for an edited date: 2000-01-01 .. 2100-01-01.
+ *
+ * ts:-1 yields monthKey "1970-01" and ts:1e300 yields "275760-09" — months no
+ * record will ever exist for, so the txn is spent from nothing and shows up
+ * nowhere. Bounding here beats bounding at the UI, which is one of several
+ * callers.
+ */
+const TS_MIN = Date.UTC(2000, 0, 1);
+const TS_MAX = Date.UTC(2100, 0, 1);
 
 /**
  * Pure half of updateTxn: validate a patch against a stored record and return
@@ -250,18 +306,24 @@ const EDITABLE = ["cent", "categoryId", "note", "ts"];
  *
  * @param {object|undefined} rec  the stored txn
  * @param {object} patch          {cent?, categoryId?, note?, ts?}
- * @param {(monthKey:string)=>boolean} isClosed
- * @returns {{ok:true, rec:object, changed:boolean}|{ok:false, error:string, monthKey?:string}}
+ * @param {{isClosed:Function, vaultIds:Set<string>, monthExists:Function,
+ *          maxWithdrawableFor:Function}} g  resolved guards
+ * @returns {{ok:true, rec:object, changed:boolean}|{ok:false, error:string, monthKey?:string, capCent?:number}}
  */
-function planUpdate(rec, patch, isClosed) {
+function planUpdate(rec, patch, g) {
   if (!rec) return { ok: false, error: "notfound" };
   // A tombstoned row is not editable: the server has already been told to
   // reverse it, and re-editing it would resurrect money the user removed.
   if (rec.deleted === 1) return { ok: false, error: "deleted" };
+  // A sweep's amount is mirrored in month.sweep.fromCent, which no edit
+  // touches — editing the row would desync the vault by the difference.
+  if (UNEDITABLE_KINDS.has(rec.kind)) {
+    return { ok: false, error: "kindlocked" };
+  }
 
   const closed = (key) => {
     try {
-      return isClosed(String(key)) === true;
+      return g.isClosed(String(key)) === true;
     } catch {
       // A throwing guard is treated as CLOSED. Refusing an edit costs the user
       // one retry; allowing one desyncs the vault silently.
@@ -307,6 +369,10 @@ function planUpdate(rec, patch, isClosed) {
   if (p.ts !== undefined) {
     const ts = toInt(p.ts);
     if (ts === null) return { ok: false, error: "date" };
+    // M7: an out-of-window date files the txn under a month key that can never
+    // have a record ("1970-01", "275760-09") — invisible everywhere, still in
+    // the log. Refuse rather than clamp: clamping silently files it elsewhere.
+    if (ts < TS_MIN || ts >= TS_MAX) return { ok: false, error: "date" };
     next.ts = ts;
     if (ts !== rec.ts) {
       // Moving the date across a month boundary MUST move the month key, or
@@ -321,9 +387,76 @@ function planUpdate(rec, patch, isClosed) {
     }
   }
 
+  /**
+   * B3: THE VAULT BOUNDARY.
+   *
+   * budget.js classifies vault spend purely BY categoryId, so moving a txn
+   * into or out of a vault category moves real money across the boundary that
+   * refusing `kind` exists to protect — same damage, different field. A ₱5,000
+   * coffee expense re-categorised to Save/Invest drops the vault by ₱5,000 and
+   * takes maxWithdrawable with it.
+   *
+   * Refused in BOTH directions. Moving out is just as wrong: it would conjure
+   * vault money that was never allocated.
+   */
+  if (next.categoryId !== rec.categoryId) {
+    const wasVault = g.vaultIds.has(rec.categoryId);
+    const isVault = g.vaultIds.has(next.categoryId);
+    if (wasVault !== isVault) {
+      return { ok: false, error: "vault", monthKey: rec.monthKey };
+    }
+  }
+
   // Destination month, when the edit moves the txn out of its month.
-  if (next.monthKey !== rec.monthKey && closed(next.monthKey)) {
-    return { ok: false, error: "closed", monthKey: next.monthKey };
+  if (next.monthKey !== rec.monthKey) {
+    if (closed(next.monthKey)) {
+      return { ok: false, error: "closed", monthKey: next.monthKey };
+    }
+    /**
+     * H5: a month with NO record is not a legal destination. isClosed() says
+     * false for a month that does not exist, so the closed guard waves it
+     * through — and the txn lands somewhere with no envelopes, invisible in
+     * every view while still sitting in the log and the sheet.
+     *
+     * Refused rather than auto-created: creating a month needs the income
+     * figure and the category snapshot, which only store.js/budget.js have.
+     * The caller must create the month first — see the contract on updateTxn.
+     */
+    let exists = false;
+    try {
+      exists = g.monthExists(next.monthKey) === true;
+    } catch {
+      exists = false; // fail closed, as with isClosed
+    }
+    if (!exists) {
+      return { ok: false, error: "nomonth", monthKey: next.monthKey };
+    }
+  }
+
+  /**
+   * H4: THE WITHDRAWAL CAP.
+   *
+   * commitWithdrawal clamps a new withdrawal through planWithdrawal, but an
+   * EDIT bypassed that entirely — a ₱1,000 withdrawal edited to ₱999,999.99
+   * was accepted, and vaultBalance floors the display at ₱0 so the overdraft
+   * was invisible. Re-run the cap on any withdrawal whose amount grows.
+   *
+   * The cap is computed EXCLUDING this txn, so its own current amount is not
+   * counted against itself (that would cap an unchanged edit at zero).
+   */
+  if (rec.kind === "withdrawal" && next.cent > rec.cent) {
+    let capCent = null;
+    try {
+      const v = g.maxWithdrawableFor(next);
+      if (Number.isFinite(v)) capCent = Math.max(0, Math.round(v));
+    } catch {
+      capCent = null;
+    }
+    // Fail closed: no usable cap means we cannot prove the edit is affordable.
+    if (capCent === null) return { ok: false, error: "guard" };
+    if (next.cent > capCent) {
+      return { ok: false, error: "cap", capCent, monthKey: next.monthKey };
+    }
   }
 
   const changed =
@@ -346,23 +479,44 @@ function planUpdate(rec, patch, isClosed) {
  * ─────────────────────────────────────────────────────────────────────────
  * CONTRACT FOR THE CALLER (read this before wiring the UI)
  *
- * `opts.isClosed` is REQUIRED. idb.js cannot import store.js, so it cannot
- * ask whether a month has been swept — the caller supplies the predicate:
+ * idb.js cannot import store.js or budget.js, so every rule that needs a month
+ * record, the category list or the vault balance arrives through `opts`. ALL
+ * FOUR are REQUIRED and every one FAILS CLOSED — omit any and the call returns
+ * {ok:false, error:"guard"} without writing. A missing guard is a programming
+ * mistake and shows up as an edit that visibly refuses; the fail-open
+ * alternative shows up as a vault balance wrong by an amount nobody can trace.
+ *
+ *     import { vaultBalance } from "./budget.js";
  *
  *     idb.updateTxn(id, patch, {
- *       isClosed: (key) => !!store.getMonth(key)?.closedAt,
+ *       // The close BANKED a figure computed from that month's txns.
+ *       isClosed:   (key) => !!store.getMonth(key)?.closedAt,
+ *       // A date edit can move a txn to a month with no record at all.
+ *       monthExists: (key) => !!store.getMonth(key),
+ *       // budget.js classifies vault spend BY categoryId.
+ *       vaultIds:   (store.getMonth(store.currentKey())?.alloc ?? [])
+ *                     .filter((a) => a.vault).map((a) => a.id),
+ *       // The cap for a withdrawal edit, EXCLUDING the txn being edited.
+ *       maxWithdrawableFor: (next) =>
+ *         vaultBalance(
+ *           store.getMonths(),
+ *           allTxns.filter((t) => t.id !== next.id),
+ *           next.monthKey,
+ *         ).balanceCent,
  *     })
  *
- * Omitting it returns {ok:false, error:"guard"} rather than defaulting to
- * "open". A missing guard is a programming mistake and shows up as an edit
- * that visibly refuses; the fail-open alternative shows up as a vault balance
- * that is wrong by an amount nobody can trace. The month close BANKED a
- * figure computed from that month's transactions, so changing one afterwards
- * desyncs the vault. Reopening is deliberate and separate: store.reopenMonth
- * (and main.js's reopenMonthForEdit, which also reverses the sweep row).
+ * `maxWithdrawableFor` is only consulted for a withdrawal whose amount GROWS,
+ * so it may be a lazy closure. It MUST exclude the edited txn, or the txn's
+ * own current amount is counted against itself.
  *
  * Both the source AND destination month are checked, because editing the date
- * can move a txn between months.
+ * can move a txn between months. A destination month with no record is
+ * REFUSED (error:"nomonth") rather than auto-created — creating one needs the
+ * income figure and category snapshot, which only store/budget hold. If the
+ * UI wants to allow that move it must create the month first, then retry.
+ *
+ * Reopening a closed month is deliberate and separate: store.reopenMonth (and
+ * main.js's reopenMonthForEdit, which also reverses the sweep row).
  *
  * The result MUST be respected — this function never throws and never
  * partially applies. On ok:false nothing was written.
@@ -387,26 +541,61 @@ function planUpdate(rec, patch, isClosed) {
  *
  * @param {string} id
  * @param {{cent?:number|string, categoryId?:string, note?:string, ts?:number}} patch
- * @param {{isClosed:(monthKey:string)=>boolean}} opts
+ * @param {{isClosed:(monthKey:string)=>boolean,
+ *          monthExists:(monthKey:string)=>boolean,
+ *          vaultIds:Iterable<string>,
+ *          maxWithdrawableFor:(next:object)=>number}} opts
  * @returns {Promise<{ok:true, txn:object, changed:boolean}
  *                  |{ok:false, error:"guard"|"notfound"|"deleted"|"kind"
- *                            |"amount"|"date"|"closed"|"storage",
- *                    monthKey?:string}>} Never rejects.
+ *                            |"kindlocked"|"amount"|"date"|"closed"|"nomonth"
+ *                            |"vault"|"cap"|"storage",
+ *                    monthKey?:string, capCent?:number}>} Never rejects.
  */
 export async function updateTxn(id, patch, opts = {}) {
   const key = String(id ?? "");
-  const isClosed = typeof opts?.isClosed === "function" ? opts.isClosed : null;
-  if (!isClosed) return { ok: false, error: "guard" };
+
+  // Every guard is mandatory and fails closed. Resolved once, up front, so a
+  // half-supplied opts object can never reach the rules half-enforced.
+  const fn = (v) => (typeof v === "function" ? v : null);
+  const g = {
+    isClosed: fn(opts?.isClosed),
+    monthExists: fn(opts?.monthExists),
+    maxWithdrawableFor: fn(opts?.maxWithdrawableFor),
+    vaultIds: null,
+  };
+  try {
+    if (opts?.vaultIds) g.vaultIds = new Set([...opts.vaultIds].map(String));
+  } catch {
+    g.vaultIds = null; // not iterable — treated as missing
+  }
+  if (!g.isClosed || !g.monthExists || !g.maxWithdrawableFor || !g.vaultIds) {
+    return { ok: false, error: "guard" };
+  }
   if (!key) return { ok: false, error: "notfound" };
 
+  // One edit per txn at a time — see serialiseUpdate(). Everything below runs
+  // with no other updateTxn for this id in flight.
+  return serialiseUpdate(key, () => runUpdate(key, patch, g));
+}
+
+/** The serialised body of updateTxn. Never rejects. */
+async function runUpdate(key, patch, g) {
   const db = await openDB();
 
   if (!db) {
+    /**
+     * Read, plan and write with NO await in between.
+     *
+     * fbRead/fbWrite are synchronous, so this whole block runs to completion
+     * as one step. Combined with the per-id chain above, two concurrent edits
+     * to different fields both survive and neither caller is handed a `txn`
+     * that disagrees with storage. Do not introduce an await here.
+     */
     const data = fbRead();
     const plan = planUpdate(
       data.txns.find((t) => t && t.id === key),
       patch,
-      isClosed,
+      g,
     );
     if (!plan.ok) return plan;
     // A no-op edit must not dirty the outbox or clear the synced flag.
@@ -421,10 +610,12 @@ export async function updateTxn(id, patch, opts = {}) {
     const store = t.objectStore(TXNS);
     const box = t.objectStore(OUTBOX);
     // Callback style, as in voidTxn: awaiting between the get and the put can
-    // let the transaction auto-commit before the write lands.
+    // let the transaction auto-commit before the write lands. The whole
+    // read-modify-write is one IndexedDB transaction, so it is already
+    // serialised against a concurrent updateTxn on the same store.
     const get = store.get(key);
     get.onsuccess = () => {
-      const plan = planUpdate(get.result, patch, isClosed);
+      const plan = planUpdate(get.result, patch, g);
       out.plan = plan;
       if (!plan.ok || !plan.changed) return;
       store.put(plan.rec);

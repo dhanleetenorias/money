@@ -148,13 +148,27 @@ row; it appends a compensating row with the opposite sign, so the sheet stays
 an audit trail. Never add a formula to a whole column here — the script writes
 ranges directly and a spilled formula would be overwritten.
 
+A void therefore puts **two rows under one TxnId** — the original and its
+tombstone. That is expected, and two rules depend on it: voids dedupe on a
+compound key rather than the bare id (deduping by id swallowed every void whose
+original had landed, which was every void that mattered), and the id→row map
+skips `void` rows so an `update` can never rewrite a tombstone back into a live
+charge.
+
 ## The `update` op
 
-> **This op requires a NEW DEPLOYMENT VERSION.** `update` was added to
-> `Code.gs` after the original deploy, so an app that sends one to an old
-> deployment gets the row appended a second time (the old code treats an
-> unknown verb as an append) instead of edited in place. Re-paste `Code.gs`
-> and publish a new version — see "Re-deploying after an edit" above.
+> **This op requires a NEW DEPLOYMENT VERSION.** Re-paste `Code.gs` and
+> publish a new version — see "Re-deploying after an edit" above.
+>
+> Against a **stale (v1) deployment** an `update` for an id already in the
+> sheet is a **silent no-op**: the old script has no `update` verb, so it takes
+> its dedupe branch and answers `accepted` having changed nothing. (Only an id
+> the sheet has never seen gets appended.) The client defends itself — it
+> refuses to clear an `update` unless the response carries the `updated` field,
+> which only v2 sends — so the edit stays queued and retries rather than
+> vanishing. You will see `edits need a newer script — re-deploy Code.gs` in
+> the sync pill, and Settings → Test will warn. Appends and voids keep working
+> normally throughout.
 
 `op:"update"` is the **only** operation that rewrites an existing row. The user
 edited a transaction's amount, category, note or date; a compensating
@@ -171,11 +185,12 @@ the row count for an ordinary typo fix.
 - An update is never reported in `duplicates` — matching an existing row is the
   point, not a reason to skip.
 
-The success response therefore carries one extra field:
+The success response therefore carries two extra fields:
 
 ```json
 {
   "ok": true,
+  "v": 2,
   "accepted": ["id"],
   "duplicates": [],
   "rejected": [],
@@ -186,6 +201,11 @@ The success response therefore carries one extra field:
 
 `rows` counts newly appended rows, `updated` counts rows rewritten in place.
 Both kinds of id appear in `accepted`, which is what the client clears.
+
+**`v` and `updated` must appear on every success, including a zero-op
+connection test and a batch that updated nothing.** Their absence is precisely
+how the client detects a stale deployment; making either conditional would
+re-open the silent-edit-loss bug. Do not "tidy" them away.
 
 Verify an update with curl — run the append from "Testing with curl" first,
 then:

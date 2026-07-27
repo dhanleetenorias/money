@@ -32,6 +32,7 @@ let reply = (body) => ({
   duplicates: [],
   rejected: [],
   rows: body.ops.length,
+  updated: 0,
 });
 
 globalThis.fetch = async (_url, init) => {
@@ -54,7 +55,17 @@ const settle = () => new Promise((r) => setTimeout(r, 900));
 const opsFor = (id) =>
   sent.flatMap((r) => r.body.ops).filter((o) => o.id === id);
 
-const open = { isClosed: () => false };
+/** How many outbox rows are still queued for an id. */
+const pendingFor = async (id) =>
+  (await idb.getOutbox()).filter((o) => o.id === id).length;
+
+/** Permissive guards — these tests are about the WIRE, not the edit rules. */
+const open = {
+  isClosed: () => false,
+  monthExists: () => true,
+  vaultIds: [],
+  maxWithdrawableFor: () => Number.MAX_SAFE_INTEGER,
+};
 
 test("W1 an edit reaches the wire as op:'update' with the CURRENT values", async () => {
   await idb.addTxn({
@@ -151,7 +162,8 @@ test("W3 the transport rails the CORS note depends on are unchanged", async () =
   assert.equal(init.headers["Content-Type"], "text/plain;charset=utf-8");
   assert.equal(init.credentials, "omit");
   assert.equal(init.redirect, "follow");
-  assert.equal(sent.at(-1).body.v, 1);
+  // v2 = the protocol that has `update`. Bumped alongside Code.gs.
+  assert.equal(sent.at(-1).body.v, 2);
 });
 
 test("W4 a junk outbox verb degrades to 'append', never to a function", async () => {
@@ -193,6 +205,7 @@ test("W4 a junk outbox verb degrades to 'append', never to a function", async ()
     duplicates: [],
     rejected: [],
     rows: body.ops.length,
+    updated: 0,
   });
   sync.kick({ force: true });
   await settle();
@@ -210,6 +223,117 @@ test("W4 a junk outbox verb degrades to 'append', never to a function", async ()
   }
 });
 
+test("W6 an ack from a STALE deployment must not clear an update", async () => {
+  // THE BLOCKER. The old Code.gs has no `update` verb: it sees an id it
+  // already holds, takes its dedupe branch, and answers
+  // {accepted:[id], duplicates:[id], rows:0} having changed nothing — and
+  // crucially WITHOUT the `updated` field, because that field did not exist.
+  //
+  // Honouring that ack is unrecoverable: the op is cleared, the sheet keeps
+  // the old amount, the app shows the new one, and nothing ever retries.
+  await idb.addTxn({
+    id: "w-old",
+    monthKey: "2026-07",
+    ts: 1783656000000,
+    cent: 18000,
+    categoryId: "coffee",
+    kind: "expense",
+  });
+  // Land the append against a good server first.
+  reply = (body) => ({
+    ok: true,
+    accepted: body.ops.map((o) => o.id),
+    duplicates: [],
+    rejected: [],
+    rows: body.ops.length,
+    updated: 0,
+  });
+  sync.kick({ force: true });
+  await settle();
+  assert.equal(await pendingFor("w-old"), 0, "precondition: append synced");
+
+  await idb.updateTxn("w-old", { cent: 180 }, open);
+  assert.equal(await pendingFor("w-old"), 1);
+
+  // Now the deployment is the OLD one: a v1 success shape, no `updated`.
+  reply = (body) => ({
+    ok: true,
+    accepted: body.ops.map((o) => o.id),
+    duplicates: body.ops.map((o) => o.id),
+    rejected: [],
+    rows: 0,
+  });
+  sync.kick({ force: true });
+  await settle();
+
+  const row = (await idb.getOutbox()).find((o) => o.id === "w-old");
+  assert.ok(row, "a v1 ack silently destroyed the edit — the sheet is stale");
+  assert.equal(row.op, "update");
+  assert.equal(row.txn.cent, 180, "the queued op lost the new amount");
+  assert.equal(
+    sync.status().staleDeployment,
+    true,
+    "the stale deployment was not surfaced to the UI",
+  );
+  assert.match(String(sync.status().lastErr), /re-deploy/i);
+
+  // Re-deploy: the same op now clears against a v2 response.
+  reply = (body) => ({
+    ok: true,
+    accepted: body.ops.map((o) => o.id),
+    duplicates: [],
+    rejected: [],
+    rows: 0,
+    updated: 1,
+  });
+  sync.kick({ force: true });
+  await settle();
+  assert.equal(await pendingFor("w-old"), 0, "the edit never recovered");
+  assert.equal(sync.status().staleDeployment, false);
+});
+
+test("W7 a stale deployment still clears appends and voids in the same batch", async () => {
+  // Only `update` is withheld. Blocking the whole batch would strand ordinary
+  // spending on a deployment that handles it perfectly well.
+  await idb.addTxn({
+    id: "w-app",
+    monthKey: "2026-07",
+    cent: 900,
+    categoryId: "food",
+  });
+  await idb.addTxn({
+    id: "w-vd",
+    monthKey: "2026-07",
+    cent: 800,
+    categoryId: "food",
+    synced: 1,
+  });
+  await idb.voidTxn("w-vd");
+  await idb.addTxn({
+    id: "w-ed",
+    monthKey: "2026-07",
+    cent: 700,
+    categoryId: "food",
+    synced: 1,
+  });
+  await idb.updateTxn("w-ed", { cent: 701 }, open);
+
+  // v1 shape — no `updated`.
+  reply = (body) => ({
+    ok: true,
+    accepted: body.ops.map((o) => o.id),
+    duplicates: [],
+    rejected: [],
+    rows: body.ops.length,
+  });
+  sync.kick({ force: true });
+  await settle();
+
+  assert.equal(await pendingFor("w-app"), 0, "an append was blocked");
+  assert.equal(await pendingFor("w-vd"), 0, "a void was blocked");
+  assert.equal(await pendingFor("w-ed"), 1, "the update was cleared anyway");
+});
+
 test("W5 an op the server did NOT name stays queued", async () => {
   await idb.addTxn({
     id: "w-4",
@@ -225,6 +349,7 @@ test("W5 an op the server did NOT name stays queued", async () => {
     duplicates: [],
     rejected: [],
     rows: 0,
+    updated: 0,
   });
   sync.kick({ force: true });
   await settle();

@@ -44,7 +44,7 @@
  * REQUEST (POST body is a JSON string, sent as text/plain to dodge the CORS
  * preflight that Apps Script cannot answer — see js/sync.js):
  *   {
- *     v: 1,
+ *     v: 2,
  *     token: "<shared secret>",
  *     ops: [{
  *       id, op:"append"|"void"|"update", ts, monthKey, kind, categoryId,
@@ -53,9 +53,15 @@
  *   }
  *
  * RESPONSE:
- *   { ok:true, accepted:[id], duplicates:[id], rejected:[{id,err}],
+ *   { ok:true, v:2, accepted:[id], duplicates:[id], rejected:[{id,err}],
  *     rows:N, updated:M }
  *   { ok:false, err:"auth"|"badjson"|"badops"|"toolarge"|"busy"|"unconfigured" }
+ *
+ * `v` and `updated` are present on EVERY success, including a zero-op
+ * connection test. Their absence is how the client detects a stale (v1)
+ * deployment and refuses to clear an `update` op that the old script silently
+ * ignored — see the handshake note in js/sync.js. Do not make either
+ * conditional.
  *
  * `accepted` is the union of newly-written, updated-in-place and
  * already-present ids: all are safe for the client to clear. `duplicates` is
@@ -67,6 +73,16 @@
 var SHEET_NAME = "App Log";
 var MAX_OPS = 200;
 var TZ = "Asia/Manila";
+
+/**
+ * Protocol version this deployment speaks. Echoed on every success.
+ *
+ * v1 = append + void only. v2 adds `update` (rewrite in place) and fixes the
+ * void dedupe. The client uses the presence of the `updated` FIELD — not this
+ * number — as the version tell, because a v1 deployment predates both and can
+ * only ever answer without it. See the handshake note in js/sync.js.
+ */
+var PROTOCOL_V = 2;
 
 /**
  * App Log columns. Order is load-bearing — the header is written once and the
@@ -101,6 +117,8 @@ var HEADERS = [
 
 /** 1-based column index of TxnId within HEADERS. */
 var ID_COL = 9;
+/** 1-based column index of Type. Read alongside TxnId to spot void rows. */
+var TYPE_COL = 3;
 var NUM_COLS = 10;
 
 // ---- entry point -----------------------------------------------------------
@@ -133,14 +151,18 @@ function doPost(e) {
     if (ops.length > MAX_OPS) return json({ ok: false, err: "toolarge" });
 
     // A zero-op request is the client's connection test. Answer without
-    // taking the lock or touching the sheet.
+    // taking the lock or touching the sheet. It carries `updated` and `v` like
+    // every other success, so Settings can tell an up-to-date deployment from
+    // a stale one BEFORE the user discovers it by losing an edit.
     if (ops.length === 0) {
       return json({
         ok: true,
+        v: PROTOCOL_V,
         accepted: [],
         duplicates: [],
         rejected: [],
         rows: 0,
+        updated: 0,
       });
     }
 
@@ -169,7 +191,7 @@ function doPost(e) {
  * that the deployment is live. It reveals nothing and writes nothing.
  */
 function doGet() {
-  return json({ ok: true, service: "money-sync", v: 1 });
+  return json({ ok: true, service: "money-sync", v: PROTOCOL_V });
 }
 
 // ---- core ------------------------------------------------------------------
@@ -186,9 +208,16 @@ function writeOps(ops) {
   var duplicates = [];
   var rejected = [];
 
-  // Within-batch duplicates matter too: the same id twice in one payload must
-  // produce one row, not two.
-  var seen = {};
+  // rowById doubles as the within-batch dedupe: a row appended by THIS batch
+  // is registered in it immediately, so the same id twice in one payload
+  // produces one row, not two — and a later update in the payload finds that
+  // row number. One map, so the dedupe and the update target can never
+  // disagree about which row owns an id.
+  // Voids dedupe on a COMPOUND key (id + a NUL + "void"), never on the bare id:
+  // a void carries the same id as the row it compensates, so deduping it by id
+  // would swallow every void whose original had landed — which is every void
+  // that matters. Keyed separately, a RETRIED void is still deduped.
+  var voidsInSheet = readVoidSet(sheet);
   var now = new Date();
   var syncedAt = Utilities.formatDate(now, TZ, "yyyy-MM-dd HH:mm:ss");
 
@@ -202,15 +231,27 @@ function writeOps(ops) {
     var op = ops[i] || {};
     var id = String(op.id == null ? "" : op.id);
     var isUpdate = String(op.op) === "update";
+    var isVoid = String(op.op) === "void";
 
     if (!id) {
       rejected.push({ id: "", err: "noid" });
       continue;
     }
 
-    // An update is NEVER a duplicate: rewriting the row it matched is the
-    // whole point. Only appends and voids dedupe by id.
-    if (!isUpdate && (rowById[id] != null || seen[id] != null)) {
+    // DEDUPE, by verb:
+    //   append — by id. A retry must not double the row.
+    //   update — NEVER. Rewriting the row it matched is the whole point.
+    //   void   — by the COMPOUND key only. A void carries the SAME id as the
+    //            row it compensates, so deduping it by bare id swallowed every
+    //            void whose original had landed, i.e. every void that matters:
+    //            the txn vanished locally and lived in the sheet forever.
+    if (isVoid) {
+      if (voidsInSheet[id] === true) {
+        duplicates.push(id);
+        accepted.push(id);
+        continue;
+      }
+    } else if (!isUpdate && rowById[id] != null) {
       // Already in the sheet (or earlier in this payload). Report it as
       // accepted so the phone stops resending it — this is the retry-safety.
       duplicates.push(id);
@@ -229,7 +270,6 @@ function writeOps(ops) {
     if (!isFinite(ts) || ts <= 0) ts = now.getTime();
     var when = new Date(ts);
 
-    var isVoid = String(op.op) === "void";
     var kind = String(op.kind || "expense");
     if (
       kind !== "income" &&
@@ -256,10 +296,14 @@ function writeOps(ops) {
       syncedAt,
     ];
 
-    // seen[id] carries the row this batch put the id on: a real row number for
-    // an append, so a later update in the same payload can target it.
     if (isUpdate) {
-      var target = rowById[id] != null ? rowById[id] : seen[id];
+      // rowById alone is the target lookup, and that is sufficient BY
+      // CONSTRUCTION: an append only proceeds when rowById has no entry for
+      // the id, and it then writes the same row number into rowById and seen.
+      // So `seen[id]`, when set, always equals `rowById[id]` — consulting it
+      // as a fallback was a dead branch. This covers the same-batch case too
+      // (G4): the append registers its row number before the update is read.
+      var target = rowById[id];
       if (target != null) {
         updates.push({ row: target, values: values });
         accepted.push(id);
@@ -270,8 +314,14 @@ function writeOps(ops) {
     }
 
     rows.push(values);
-    seen[id] = nextRow;
-    rowById[id] = nextRow;
+    if (isVoid) {
+      // A void APPENDS a compensating row that carries the same id. It must
+      // NOT claim the id's row slot: rowById/seen point at the row an update
+      // would rewrite, and that is the ORIGINAL, never the tombstone.
+      voidsInSheet[id] = true;
+    } else {
+      rowById[id] = nextRow;
+    }
     nextRow += 1;
     accepted.push(id);
   }
@@ -293,6 +343,10 @@ function writeOps(ops) {
 
   return {
     ok: true,
+    // `v` and `updated` are the version tell. `updated` must be present on
+    // EVERY success, including zero — its absence is what tells the client it
+    // is talking to a v1 deployment that would silently drop an edit.
+    v: PROTOCOL_V,
     accepted: accepted,
     duplicates: duplicates,
     rejected: rejected,
@@ -323,30 +377,60 @@ function getLogSheet() {
 }
 
 /**
- * Existing txn ids -> their 1-BASED ROW NUMBER. Reads ONE column, which is why
- * the id lives in its own column — pulling the whole grid would be far slower.
+ * Non-void txn ids -> their 1-BASED ROW NUMBER. Reads TWO columns (Type and
+ * TxnId) in one getValues, which is still far cheaper than pulling the grid.
  *
  * Returns row numbers rather than a presence flag so an `update` can rewrite
  * its row with a single getRange(row, 1, 1, NUM_COLS).setValues([...]). A
  * non-null entry still answers "is this id already in the sheet", which is all
  * the append path needs.
  *
- * A void appends a SECOND row carrying the same id, so an id can legitimately
- * appear more than once. The map keeps the LAST occurrence: for the append
- * path any occurrence proves presence, and for an update the newest row is the
- * one the user is looking at. (An update to a voided txn is refused client-
- * side anyway — idb.updateTxn rejects a tombstoned record.)
+ * VOID ROWS ARE SKIPPED. A void appends a compensating row carrying the SAME
+ * id as the row it reverses, so an id can legitimately appear twice — and an
+ * update must always target the ORIGINAL, never the tombstone. Rewriting a
+ * tombstone would turn a reversal back into a live charge.
+ *
+ * Among non-void rows the map keeps the FIRST occurrence. Appends dedupe by
+ * id against this map, so the first row is the canonical one every later
+ * append was checked against; a second non-void row for one id can only be
+ * pre-existing corruption or a hand edit. Targeting the canonical row keeps
+ * the append and update paths agreeing on which row owns an id.
  */
 function readIdRows(sheet) {
   var map = {};
   var last = sheet.getLastRow();
   if (last < 2) return map;
-  var values = sheet.getRange(2, ID_COL, last - 1, 1).getValues();
+  // Columns C..I in one read: [0] = Type, [ID_COL - TYPE_COL] = TxnId.
+  var span = ID_COL - TYPE_COL + 1;
+  var values = sheet.getRange(2, TYPE_COL, last - 1, span).getValues();
   for (var i = 0; i < values.length; i++) {
-    var id = values[i][0];
-    if (id !== "" && id != null) map[String(id)] = i + 2; // +2: header + 0-based
+    var id = values[i][span - 1];
+    if (id === "" || id == null) continue;
+    if (String(values[i][0]) === "void") continue; // tombstone, never a target
+    var k = String(id);
+    if (map[k] == null) map[k] = i + 2; // +2: header row + 0-based index
   }
   return map;
+}
+
+/**
+ * Ids that already have a VOID row in the sheet. Voids are keyed separately
+ * from appends precisely because they share an id with the row they reverse —
+ * see the dedupe block in writeOps(). This is what still makes a RETRIED void
+ * idempotent without swallowing the first one.
+ */
+function readVoidSet(sheet) {
+  var set = {};
+  var last = sheet.getLastRow();
+  if (last < 2) return set;
+  var span = ID_COL - TYPE_COL + 1;
+  var values = sheet.getRange(2, TYPE_COL, last - 1, span).getValues();
+  for (var i = 0; i < values.length; i++) {
+    var id = values[i][span - 1];
+    if (id === "" || id == null) continue;
+    if (String(values[i][0]) === "void") set[String(id)] = true;
+  }
+  return set;
 }
 
 /**

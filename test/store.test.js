@@ -530,17 +530,60 @@ test("R4 the sweep TXN row must be reversed on reopen, or the sheet double-count
  * these lean on the outbox invariants rather than just the stored values:
  * exactly one op per id, always, and never one that a stale ack can destroy.
  *
- * updateTxn REQUIRES an isClosed predicate — idb.js cannot import store.js, so
- * the caller supplies the closed-month guard. `open` is the everything-open
- * predicate; `closedGuard` is what main.js will actually pass.
+ * updateTxn REQUIRES four guards — idb.js cannot import store.js or budget.js,
+ * so the caller supplies everything that needs a month record, the category
+ * list or the vault balance. Every one FAILS CLOSED (E9).
+ *
+ *   `open`        — everything permissive: nothing closed, every month exists,
+ *                   no vault categories, an effectively unlimited cap. The
+ *                   right default for tests about something OTHER than a guard.
+ *   `realGuards`  — what main.js will actually pass, wired to the live store.
  * ------------------------------------------------------------------ */
 
-const open = { isClosed: () => false };
-const closedGuard = { isClosed: (k) => !!store.getMonth(k)?.closedAt };
+const open = {
+  isClosed: () => false,
+  monthExists: () => true,
+  vaultIds: [],
+  maxWithdrawableFor: () => Number.MAX_SAFE_INTEGER,
+};
+
+/** Vault category ids as budget.js classifies them: alloc entries with vault:true. */
+const vaultIdsFrom = (key = "2026-07") =>
+  (store.getMonth(key)?.alloc ?? []).filter((a) => a.vault).map((a) => a.id);
+
+const realGuards = (txns = []) => ({
+  isClosed: (k) => !!store.getMonth(k)?.closedAt,
+  monthExists: (k) => !!store.getMonth(k),
+  vaultIds: vaultIdsFrom(),
+  maxWithdrawableFor: (next) =>
+    vaultBalance(
+      store.getMonths(),
+      txns.filter((t) => t.id !== next.id),
+      next.monthKey,
+    ).balanceCent,
+});
+
+/**
+ * Closed-month guard wired to the store; the rest permissive.
+ * monthExists stays permissive so these tests isolate the CLOSED rule from
+ * the missing-month rule (H5), which E10 covers separately.
+ */
+const closedGuard = { ...open, isClosed: (k) => !!store.getMonth(k)?.closedAt };
 
 /** Read the raw fallback blob — the same trick the F2 tests use. */
 const rawFb = () =>
   JSON.parse(localStorage.getItem("mn.idbfallback.v1") || "null");
+
+/**
+ * How many `update` ops are queued for an id.
+ *
+ * A REFUSED edit must not queue one — but a freshly seeded txn legitimately
+ * still has its pending `put`, so asserting an empty outbox would pass for the
+ * wrong reason (or fail for one). Count the verb that matters.
+ */
+const updateOpsFor = async (id) =>
+  (await idb.getOutbox()).filter((o) => o.id === id && o.op === "update")
+    .length;
 
 async function seed(over = {}) {
   return idb.addTxn({
@@ -659,13 +702,16 @@ test("E3 kind cannot be changed — an expense never becomes a withdrawal", asyn
   assert.equal(ok.txn.kind, "expense");
   assert.equal(ok.txn.cent, 50000);
 
-  // Every other kind is equally locked.
-  for (const k of ["income", "sweep", "expense"]) {
+  // Every other kind is equally locked. A sweep refuses EARLIER, on
+  // "kindlocked" (M6) — its amount is mirrored in month.sweep.fromCent — so
+  // either refusal is correct as long as the kind never moves.
+  for (const k of ["income", "sweep", "expense", "withdrawal"]) {
     await idb.addTxn({ id: `k-${k}`, monthKey: "2026-07", cent: 1, kind: k });
     const bad = k === "expense" ? "income" : "expense";
-    assert.equal(
-      (await idb.updateTxn(`k-${k}`, { kind: bad }, open)).error,
-      "kind",
+    const err = (await idb.updateTxn(`k-${k}`, { kind: bad }, open)).error;
+    assert.ok(
+      err === "kind" || (k === "sweep" && err === "kindlocked"),
+      `${k} accepted a kind change (got ${err})`,
     );
     assert.equal(
       (await idb.getAllTxns()).find((t) => t.id === `k-${k}`).kind,
@@ -859,16 +905,42 @@ test("E8 an edit in a CLOSED month is refused at the data layer", async () => {
   assert.equal(op.txn.cent, 999999);
 });
 
-test("E9 the guard is mandatory, and the other refusals write nothing", async () => {
+test("E9 EVERY guard is mandatory, and the other refusals write nothing", async () => {
   await seed();
 
-  // No predicate = refused. Fail-open would corrupt the vault silently.
+  // No guards at all = refused. Fail-open would corrupt the vault silently.
   assert.equal((await idb.updateTxn("u1", { cent: 1 })).error, "guard");
   assert.equal((await idb.updateTxn("u1", { cent: 1 }, {})).error, "guard");
+
+  // Each guard is INDIVIDUALLY required: dropping any one must refuse, not
+  // half-enforce. A partially-wired opts object is the realistic mistake — the
+  // UI engineer adds one guard, ships, and the other three silently do nothing.
+  for (const missing of [
+    "isClosed",
+    "monthExists",
+    "vaultIds",
+    "maxWithdrawableFor",
+  ]) {
+    const partial = { ...open };
+    delete partial[missing];
+    assert.equal(
+      (await idb.updateTxn("u1", { cent: 1 }, partial)).error,
+      "guard",
+      `a missing ${missing} was allowed through`,
+    );
+    // Wrong TYPE is refused too, not coerced.
+    assert.equal(
+      (await idb.updateTxn("u1", { cent: 1 }, { ...open, [missing]: 1 })).error,
+      "guard",
+      `a non-callable ${missing} was allowed through`,
+    );
+  }
+  // Nothing above wrote.
   assert.equal(
-    (await idb.updateTxn("u1", { cent: 1 }, { isClosed: 1 })).error,
-    "guard",
+    (await idb.getTxns("2026-07")).find((t) => t.id === "u1").cent,
+    18000,
   );
+
   // A THROWING guard reads as closed: a refused edit costs one retry, an
   // allowed one desyncs the vault.
   assert.equal(
@@ -877,6 +949,7 @@ test("E9 the guard is mandatory, and the other refusals write nothing", async ()
         "u1",
         { cent: 1 },
         {
+          ...open,
           isClosed: () => {
             throw new Error("boom");
           },
@@ -884,6 +957,22 @@ test("E9 the guard is mandatory, and the other refusals write nothing", async ()
       )
     ).error,
     "closed",
+  );
+  // A throwing monthExists fails closed the same way — on a date move.
+  assert.equal(
+    (
+      await idb.updateTxn(
+        "u1",
+        { ts: manila(2026, 9, 2).getTime() },
+        {
+          ...open,
+          monthExists: () => {
+            throw new Error("boom");
+          },
+        },
+      )
+    ).error,
+    "nomonth",
   );
 
   assert.equal(
@@ -916,6 +1005,272 @@ test("E9 the guard is mandatory, and the other refusals write nothing", async ()
   assert.equal((await idb.updateTxn("u1", {}, open)).changed, false);
   assert.equal((await idb.updateTxn("u1", null, open)).changed, false);
   assert.equal((await idb.updateTxn("u1", undefined, open)).ok, true);
+});
+
+/* ------------------------------------------------------------------ *
+ * E10-E15 — the boundaries an edit must not walk across.
+ *
+ * Refusing `kind` protects the vault/spendable split. These pin every OTHER
+ * route to the same damage, each of which was reachable through a field the
+ * first cut happily accepted.
+ * ------------------------------------------------------------------ */
+
+test("E10 categoryId must not carry a txn across the VAULT boundary", async () => {
+  // budget.js classifies vault spend purely BY categoryId, so re-categorising
+  // into Save/Invest moves real money across the line that refusing `kind`
+  // exists to defend — same damage, different field.
+  const m = freshMonth("2026-07");
+  store.upsertMonth(m);
+  const vaultId = vaultIdsFrom()[0];
+  assert.ok(vaultId, "precondition: the month has a vault category");
+
+  await seed({ cent: 500000, categoryId: "coffee" });
+  let txns = await idb.getAllTxns();
+  const before = vaultBalance(store.getMonths(), txns).balanceCent;
+  const beforeMax = maxWithdrawable(store.getMonths(), txns, "2026-07");
+
+  const res = await idb.updateTxn("u1", { categoryId: vaultId }, realGuards());
+  assert.equal(res.ok, false, "an expense was re-categorised into the vault");
+  assert.equal(res.error, "vault");
+
+  txns = await idb.getAllTxns();
+  assert.equal(
+    vaultBalance(store.getMonths(), txns).balanceCent,
+    before,
+    "the vault balance moved",
+  );
+  assert.equal(maxWithdrawable(store.getMonths(), txns, "2026-07"), beforeMax);
+  assert.equal(txns.find((t) => t.id === "u1").categoryId, "coffee");
+  assert.equal(await updateOpsFor("u1"), 0, "a refused edit queued an update");
+
+  // Refused in the OTHER direction too — moving OUT would conjure vault money
+  // that was never allocated.
+  await idb.addTxn({
+    id: "u9",
+    monthKey: "2026-07",
+    ts: manila(2026, 7, 9).getTime(),
+    cent: 1000,
+    categoryId: vaultId,
+    kind: "expense",
+  });
+  assert.equal(
+    (await idb.updateTxn("u9", { categoryId: "coffee" }, realGuards())).error,
+    "vault",
+  );
+
+  // A move between two NON-vault categories is still perfectly legal.
+  const ok = await idb.updateTxn("u1", { categoryId: "food" }, realGuards());
+  assert.equal(ok.ok, true, "an ordinary re-category was refused");
+  assert.equal(ok.txn.categoryId, "food");
+});
+
+test("E11 editing a withdrawal's amount is still capped by the vault", async () => {
+  // commitWithdrawal clamps through planWithdrawal; the edit path bypassed it
+  // entirely. vaultBalance floors at 0, so the overdraft was invisible.
+  const m = freshMonth("2026-07");
+  store.upsertMonth(m);
+  const vaultId = vaultIdsFrom()[0];
+
+  await idb.addTxn({
+    id: "wd",
+    monthKey: "2026-07",
+    ts: manila(2026, 7, 10).getTime(),
+    cent: 100000,
+    categoryId: vaultId,
+    note: "gift",
+    kind: "withdrawal",
+  });
+  const cap = maxWithdrawable(store.getMonths(), [], "2026-07");
+  assert.ok(cap > 0);
+
+  const over = await idb.updateTxn(
+    "wd",
+    { cent: 99999999 },
+    realGuards(await idb.getAllTxns()),
+  );
+  assert.equal(
+    over.ok,
+    false,
+    "a withdrawal was edited past the vault balance",
+  );
+  assert.equal(over.error, "cap");
+  assert.equal(over.capCent, cap);
+  assert.equal(
+    (await idb.getAllTxns()).find((t) => t.id === "wd").cent,
+    100000,
+  );
+
+  // Exactly at the cap is allowed — the cap EXCLUDES the txn being edited, so
+  // its own current amount is not counted against itself.
+  const atCap = await idb.updateTxn(
+    "wd",
+    { cent: cap },
+    realGuards(await idb.getAllTxns()),
+  );
+  assert.equal(atCap.ok, true, "a withdrawal could not be raised to the cap");
+  assert.equal(atCap.txn.cent, cap);
+
+  // Shrinking never consults the cap at all.
+  const down = await idb.updateTxn(
+    "wd",
+    { cent: 5000 },
+    realGuards(await idb.getAllTxns()),
+  );
+  assert.equal(down.ok, true, "reducing a withdrawal was refused");
+
+  // An expense of the same size is unaffected by the withdrawal cap.
+  await seed({ cent: 1000 });
+  assert.equal(
+    (await idb.updateTxn("u1", { cent: 99999999 }, realGuards())).ok,
+    true,
+  );
+});
+
+test("E12 a date edit must not file a txn under a month with no record", async () => {
+  // isClosed() answers false for a month that does not exist, so the closed
+  // guard waves the move through and the txn lands somewhere with no
+  // envelopes — invisible in every view, still in the log and the sheet.
+  store.upsertMonth(freshMonth("2026-07"));
+  await seed();
+  assert.equal(store.getMonth("2026-11"), null, "precondition: no record");
+
+  const res = await idb.updateTxn(
+    "u1",
+    { ts: manila(2026, 11, 3).getTime() },
+    realGuards(),
+  );
+  assert.equal(res.ok, false, "a txn was filed under a nonexistent month");
+  assert.equal(res.error, "nomonth");
+  assert.equal(res.monthKey, "2026-11");
+  assert.equal(
+    (await idb.getAllTxns()).find((t) => t.id === "u1").monthKey,
+    "2026-07",
+  );
+  assert.equal(await updateOpsFor("u1"), 0, "a refused edit queued an update");
+
+  // Creating the month first is what the contract tells the caller to do.
+  store.upsertMonth(freshMonth("2026-11"));
+  const after = await idb.updateTxn(
+    "u1",
+    { ts: manila(2026, 11, 3).getTime() },
+    realGuards(),
+  );
+  assert.equal(after.ok, true, "creating the month did not unblock the move");
+  assert.equal(after.txn.monthKey, "2026-11");
+});
+
+test("E13 a sweep row is not editable at all", async () => {
+  // A sweep's figure is banked separately as month.sweep.fromCent, which
+  // vaultBalance reads and which no edit touches — so editing the row would
+  // desync the vault by exactly the difference.
+  const m = freshMonth("2026-06");
+  store.upsertMonth(m);
+  await idb.addTxn({
+    id: "sw",
+    monthKey: "2026-06",
+    ts: manila(2026, 6, 30).getTime(),
+    cent: 1075000,
+    categoryId: "save",
+    note: "Month close sweep",
+    kind: "sweep",
+  });
+
+  for (const patch of [{ cent: 1 }, { note: "x" }, { categoryId: "food" }]) {
+    const res = await idb.updateTxn("sw", patch, realGuards());
+    assert.equal(res.ok, false, `a sweep accepted ${JSON.stringify(patch)}`);
+    assert.equal(res.error, "kindlocked");
+  }
+  assert.equal(
+    (await idb.getAllTxns()).find((t) => t.id === "sw").cent,
+    1075000,
+  );
+  assert.equal(await updateOpsFor("sw"), 0, "a refused edit queued an update");
+});
+
+test("E14 an absurd date is refused rather than filed under a junk month", async () => {
+  store.upsertMonth(freshMonth("2026-07"));
+  await seed();
+
+  // Each of these produced a real monthKey no record can ever exist for:
+  // -1 → "1970-01", 1e300 → "275760-09".
+  for (const ts of [-1, 0, 1e300, -1e300, 8.64e15, Number.MAX_SAFE_INTEGER]) {
+    const res = await idb.updateTxn("u1", { ts }, realGuards());
+    assert.equal(res.ok, false, `ts:${ts} was accepted`);
+    assert.equal(res.error, "date", `ts:${ts} gave ${res.error}`);
+  }
+  const row = (await idb.getAllTxns()).find((t) => t.id === "u1");
+  assert.equal(row.monthKey, "2026-07");
+  assert.equal(row.ts, manila(2026, 7, 10).getTime());
+  assert.equal(await updateOpsFor("u1"), 0, "a refused edit queued an update");
+
+  // A date inside the window is still fine.
+  assert.equal(
+    (
+      await idb.updateTxn(
+        "u1",
+        { ts: manila(2026, 7, 28).getTime() },
+        realGuards(),
+      )
+    ).ok,
+    true,
+  );
+});
+
+test("E15 concurrent edits to one txn serialise — neither field is lost", async () => {
+  // The fallback path is read-modify-write over a shared blob. It happens to
+  // be safe today only because there is no await between its read and its
+  // write — add one anywhere in that window and two edits plan from the same
+  // snapshot, the second erases the first one's field, and the user watches
+  // both saves succeed. updateTxn chains per txn id so the invariant is
+  // structural; this test states the invariant rather than a past bug.
+  store.upsertMonth(freshMonth("2026-07"));
+  await seed({ cent: 1000, note: "orig" });
+
+  const [a, b] = await Promise.all([
+    idb.updateTxn("u1", { cent: 5000 }, open),
+    idb.updateTxn("u1", { note: "edited" }, open),
+  ]);
+  assert.equal(a.ok, true);
+  assert.equal(b.ok, true);
+
+  const stored = (await idb.getAllTxns()).find((t) => t.id === "u1");
+  assert.equal(stored.cent, 5000, "the amount edit was lost");
+  assert.equal(stored.note, "edited", "the note edit was lost");
+
+  // The edits ran in SEQUENCE, so each return is a truthful snapshot of that
+  // call's own commit — and the one that committed LAST must match storage.
+  // (Whichever wins the race, the later `txn` carries both fields.)
+  const last = b.txn.note === "edited" && b.txn.cent === 5000 ? b : a;
+  assert.equal(
+    last.txn.cent,
+    stored.cent,
+    "the final return misreports storage",
+  );
+  assert.equal(
+    last.txn.note,
+    stored.note,
+    "the final return misreports storage",
+  );
+  // Neither call may report a field it never saw AND never wrote.
+  assert.ok(a.txn.cent === 5000 || a.txn.cent === 1000);
+  assert.ok(b.txn.cent === 5000 || b.txn.cent === 1000);
+
+  // Still exactly one op, carrying the merged result.
+  const out = await idb.getOutbox();
+  assert.equal(out.length, 1);
+  assert.equal(out[0].txn.cent, 5000);
+  assert.equal(out[0].txn.note, "edited");
+
+  // Ten piled-up edits all land, and the chain does not leak.
+  const patches = Array.from({ length: 10 }, (_, i) => ({ cent: 1000 + i }));
+  const all = await Promise.all(
+    patches.map((p) => idb.updateTxn("u1", p, open)),
+  );
+  assert.ok(all.every((r) => r.ok));
+  const finalRow = (await idb.getAllTxns()).find((t) => t.id === "u1");
+  assert.equal(finalRow.cent, 1009, "the last queued edit did not win");
+  assert.equal(finalRow.note, "edited", "a piled-up edit clobbered the note");
+  assert.equal((await idb.getOutbox()).filter((o) => o.id === "u1").length, 1);
 });
 
 test("R5 the home vault card reads the CUMULATIVE balance, not one month", () => {

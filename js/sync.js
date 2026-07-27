@@ -36,7 +36,7 @@
  *
  * REQUEST  (POST, body is a JSON string sent as text/plain)
  *   {
- *     v: 1,
+ *     v: 2,
  *     token: "<shared secret>",
  *     ops: [{
  *       id:         "uuid",                 // idempotency key = the txn id
@@ -52,7 +52,9 @@
  *   }
  *
  * RESPONSE
- *   { ok:true, accepted:[ids], duplicates:[ids], rejected:[{id,err}], rows:N }
+ *   v2 { ok:true, v:2, accepted:[ids], duplicates:[ids], rejected:[{id,err}],
+ *        rows:N, updated:M }
+ *   v1 { ok:true, accepted:[ids], duplicates:[ids], rejected:[{id,err}], rows:N }
  *   { ok:false, err:"auth"|"badjson"|"badops"|"toolarge"|"busy"|"unconfigured" }
  *
  * `accepted` is authoritative and INCLUDES ids the server already had (a
@@ -66,6 +68,29 @@
  * shape as an append, only the verb differs. It is never sent as `append`,
  * because the server dedupes appends by id and a landed original would keep
  * the stale numbers.
+ *
+ * ─────────────────────────────────────────────────────────────────────────
+ * VERSION HANDSHAKE — why an ack is not always trusted
+ * `update` was added after the first deployment, and Apps Script keeps
+ * serving the OLD published version until a human publishes a new one. A v1
+ * script has no `update` verb, so it falls into its dedupe branch and answers
+ * `{accepted:[id], duplicates:[id], rows:0}` having changed nothing.
+ *
+ * That ack is a lie, and honouring it is unrecoverable: the op is cleared, the
+ * sheet keeps the old amount, the app shows the new one, and nothing retries.
+ * (Note for anyone who read the original commit message: an update against a
+ * stale deployment is only appended as a second row when the id is UNKNOWN to
+ * the sheet. For the common case — editing an already-synced txn — it is a
+ * silent no-op.)
+ *
+ * So the client requires PROOF of capability: a v2 response carries an
+ * `updated` field on every success, including zero and including the zero-op
+ * connection test. Its absence means v1, and `update` ops are then withheld
+ * from the clear — they stay queued and retry, which is the safe failure.
+ * Appends and voids in the same batch are unaffected and still clear normally.
+ * The condition is surfaced as status().staleDeployment so the UI can say
+ * "re-deploy" instead of showing a spinner forever.
+ * ─────────────────────────────────────────────────────────────────────────
  */
 
 import { getOutbox, markSynced, clearOutbox } from "./idb.js";
@@ -104,6 +129,13 @@ let pending = 0;
 let lastOkAt = null;
 let lastErr = null;
 let nextRetryAt = null;
+
+/**
+ * True once a server has acked without proving it understands `update`.
+ * Surfaced in status() so Settings can say "re-deploy the script" rather than
+ * leaving the user with edits that queue forever for no visible reason.
+ */
+let staleDeployment = false;
 
 let debounceTimer = null;
 let retryTimer = null;
@@ -255,7 +287,10 @@ async function postBatch(ops) {
   const token = getToken();
   if (!url || !token) return { ok: false, err: "not configured" };
 
-  const body = JSON.stringify({ v: 1, token, ops });
+  // v:2 = the protocol that has `update`. The server does not gate on this
+  // (a v1 script ignores it entirely) — it is the RESPONSE that tells us which
+  // version we reached. Sent so the sheet-side logs are unambiguous.
+  const body = JSON.stringify({ v: 2, token, ops });
 
   let ctrl = null;
   let timer = null;
@@ -310,7 +345,14 @@ async function postBatch(ops) {
       ...idList(data.accepted),
       ...idList(data.duplicates),
     ]);
-    return { ok: true, accepted: [...acked] };
+    // THE VERSION TELL. See the handshake note at the top of this file: a v1
+    // deployment answers a success WITHOUT `updated`, and its ack for an
+    // `update` is a lie. Report the capability; drain() decides what to clear.
+    return {
+      ok: true,
+      accepted: [...acked],
+      canUpdate: typeof data.updated === "number",
+    };
   } catch (e) {
     const name = e?.name === "AbortError" ? "timeout" : "network";
     return { ok: false, err: name };
@@ -375,7 +417,28 @@ async function drain() {
 
       // Only clear what the SERVER named, and only if we actually sent it —
       // a confused server must not be able to delete unrelated queued ops.
-      const acked = res.accepted.filter((id) => sent.has(id));
+      let acked = res.accepted.filter((id) => sent.has(id));
+
+      // THE HANDSHAKE. A v1 deployment has no `update` verb: it sees an id it
+      // already holds, takes its dedupe branch, and answers "accepted" having
+      // changed nothing. Honouring that ack clears the edit from the outbox
+      // forever — the sheet keeps the old amount, the app shows the new one,
+      // and nothing ever retries. So an `update` is only clearable when the
+      // response proves the server understands one.
+      if (!res.canUpdate) {
+        const stale = new Set(
+          batch.filter((r) => r.op === "update").map((r) => String(r.id)),
+        );
+        if (stale.size) {
+          acked = acked.filter((id) => !stale.has(id));
+          // Not a transport failure — appends and voids in the same batch are
+          // still landing correctly, so this must not poison the backoff. It
+          // is a deployment problem, and it needs a human.
+          staleDeployment = true;
+        }
+      } else {
+        staleDeployment = false;
+      }
 
       if (acked.length) {
         await markSynced(acked);
@@ -398,6 +461,12 @@ async function drain() {
         } else {
           // Some progress — the stragglers retry on the next kick.
           lastErr = `${batch.length - acked.length} not accepted`;
+        }
+        // A withheld update is a stale DEPLOYMENT, not a flaky server, and
+        // retrying cannot fix it. Say so plainly — this message is the only
+        // thing standing between the user and edits that queue silently.
+        if (staleDeployment) {
+          lastErr = "edits need a newer script — re-deploy Code.gs";
         }
         break;
       }
@@ -479,9 +548,14 @@ export function kick(opts = {}) {
 
 /**
  * Snapshot for the sync pill.
+ *
+ * `staleDeployment` true means the Web App is running a pre-`update` Code.gs:
+ * appends and voids still work, but EDITS cannot sync and are queueing. The
+ * fix is a re-deploy, not a retry — surface it as an action, not a spinner.
+ *
  * @returns {{pending:number, lastOkAt:number|null, lastErr:string|null,
  *            configured:boolean, online:boolean, syncing:boolean,
- *            nextRetryAt:number|null}}
+ *            nextRetryAt:number|null, staleDeployment:boolean}}
  */
 export function status() {
   return {
@@ -492,6 +566,7 @@ export function status() {
     online: isOnline(),
     syncing: inFlight,
     nextRetryAt,
+    staleDeployment,
   };
 }
 
@@ -556,8 +631,18 @@ export async function testConnection() {
   if (res.ok) {
     lastErr = null;
     lastOkAt = Date.now();
+    // The zero-op reply carries `updated` on a current deployment, so this is
+    // the cheap place to catch a stale one — before the user loses an edit.
+    staleDeployment = !res.canUpdate;
     emit();
-    return { ok: true };
+    return staleDeployment
+      ? {
+          ok: true,
+          warning:
+            "Connected, but this deployment is out of date — edits will not " +
+            "sync until you publish a new version of Code.gs.",
+        }
+      : { ok: true };
   }
   lastErr = res.err;
   emit();
