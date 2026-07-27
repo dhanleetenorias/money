@@ -22,6 +22,8 @@ import {
   renderWithdrawSheet,
   renderSettingsScreen,
   renderHistoryScreen,
+  renderCategoryScreen,
+  renderEditSheet,
 } from "../js/render.js";
 
 /** The payloads. Each one breaks out of a different context. */
@@ -336,6 +338,92 @@ test("renderHistoryScreen: hostile months, notes and kinds stay inert", () => {
   }
   assertInert(renderHistoryScreen({ months: [] }), "renderHistoryScreen empty");
   assertInert(renderHistoryScreen(), "renderHistoryScreen undefined");
+});
+
+test("renderCategoryScreen: hostile names, ids, notes and states stay inert", () => {
+  for (const p of HOSTILE) {
+    const html = renderCategoryScreen({
+      id: p,
+      name: p,
+      monthLabel: p,
+      pct: p,
+      allocCent: 200000,
+      spentCent: 50000,
+      leftCent: 150000,
+      ratio: p, // straight into transform:scaleX()
+      state: p, // straight into a class attribute
+      over: true,
+      overCent: 1000,
+      paceTick: p, // straight into left:%
+      closed: false,
+      txns: [
+        { id: p, ts: Date.now(), cent: 5000, categoryId: p, note: p, kind: p },
+      ],
+    });
+    assertInert(html, `renderCategoryScreen ${p}`);
+    assert.ok(
+      !/scaleX\([^)]*[<>"']/.test(html),
+      `scaleX carried markup for ${p}`,
+    );
+    assert.ok(!/left:[^%;"]*[<>"']/.test(html), `left carried markup for ${p}`);
+  }
+  // The empty branch renders different nodes — cover it with the same payloads.
+  for (const p of HOSTILE) {
+    assertInert(
+      renderCategoryScreen({ id: p, name: p, monthLabel: p, txns: [] }),
+      `renderCategoryScreen empty ${p}`,
+    );
+    assertInert(
+      renderCategoryScreen({ id: p, name: p, monthLabel: p, closed: true }),
+      `renderCategoryScreen closed ${p}`,
+    );
+  }
+  assertInert(renderCategoryScreen(), "renderCategoryScreen undefined");
+  assertInert(renderCategoryScreen({}), "renderCategoryScreen empty vm");
+});
+
+test("renderEditSheet: hostile values, notes and category ids stay inert", () => {
+  for (const p of HOSTILE) {
+    for (const kind of ["expense", "withdrawal", "income", p]) {
+      const html = renderEditSheet({
+        id: p,
+        kind,
+        cent: 5000,
+        amountText: p,
+        categoryId: p,
+        note: p,
+        ts: Date.now(),
+        categories: [
+          { id: p, name: p },
+          { id: p + "2", name: p },
+        ],
+        dateMin: p,
+        dateMax: p,
+      });
+      assertInert(html, `renderEditSheet ${kind}/${p}`);
+    }
+  }
+  assertInert(renderEditSheet(), "renderEditSheet undefined");
+  assertInert(renderEditSheet({}), "renderEditSheet empty vm");
+});
+
+test("renderAddSheet: a hostile preset id cannot break the prefilled branch", () => {
+  // presetId is matched against the category list, so a payload that matches
+  // reaches BOTH the title and a second data-cat-id attribute.
+  for (const p of HOSTILE) {
+    assertInert(
+      renderAddSheet({ categories: [{ id: p, name: p }], presetId: p }),
+      `renderAddSheet preset ${p}`,
+    );
+  }
+  // A preset naming a category that isn't there must degrade to the plain
+  // sheet, not render a commit button for a category the user can't see.
+  const html = renderAddSheet({
+    categories: [{ id: "food", name: "Food" }],
+    presetId: "gone",
+  });
+  assert.ok(!html.includes("sheet-commit"), "a stale preset must not commit");
+  assert.ok(!html.includes("chip--active"), "nothing should look selected");
 });
 
 test("every attribute interpolation in render.js is escaped or forced numeric", () => {

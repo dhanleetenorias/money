@@ -42,9 +42,11 @@ const MONTH_NAMES = [
 ];
 
 /**
- * @type {{screen:'home'|'settings'|'history',
- *         sheet:'add'|'income'|'withdraw'|null,
+ * @type {{screen:'home'|'settings'|'history'|'category',
+ *         sheet:'add'|'income'|'withdraw'|'edit'|null,
  *         openMonth:string|null,
+ *         catId:string|null,
+ *         editId:string|null,
  *         syncOff:(()=>void)|null}}
  * `syncOff` is the sync.onChange unsubscribe. It is ONLY ever non-null while
  * the settings screen is mounted — leaving the screen must drop it, or every
@@ -57,6 +59,13 @@ const ui = {
   syncOff: null,
   /** Cumulative vault balance, read once when the withdraw sheet opens. */
   withdrawMaxCent: 0,
+  /** The category whose detail screen is open. */
+  catId: null,
+  /** The txn the edit sheet is editing, and the snapshot it opened with. */
+  editId: null,
+  editTxn: null,
+  /** Category preselected for the add sheet, from a category screen's +. */
+  addCatId: null,
 };
 
 /* ------------------------------------------------------------------ *
@@ -160,6 +169,56 @@ async function homeVM() {
   };
 }
 
+/**
+ * The category detail screen's VM.
+ *
+ * Every number comes from budget.js — envelopeState is the SAME function Home
+ * derives its row from, so the two screens cannot disagree about what "left"
+ * means. Names come from the month's own alloc snapshot for the same reason
+ * History does: renaming a category in Settings must not retitle the past.
+ *
+ * @returns {Promise<object|null>} null when the category isn't in this month
+ */
+async function categoryVM() {
+  const key = ym(Date.now());
+  const month = store.getMonth(key);
+  const catId = ui.catId;
+  if (!month || !catId) return null;
+
+  const entry = (month.alloc ?? []).find((a) => a.id === catId);
+  if (!entry) return null;
+
+  const txns = await idb.getTxns(key);
+  const now = Date.now();
+  const env = B.envelopeState(month, txns, catId, now);
+  if (!env) return null;
+
+  // Newest first. Sweep rows are excluded from every spend figure by budget.js
+  // (see spendIndex), so listing them here under a "spent" header would print
+  // a row that no total accounts for. Withdrawals against a vault category DO
+  // count against that category's own state, so they stay.
+  const rows = txns
+    .filter((t) => t.categoryId === catId && t.kind !== "sweep")
+    .sort((a, b) => b.ts - a.ts);
+
+  return {
+    id: env.id,
+    name: entry.name ?? env.name,
+    monthLabel: monthLabel(key),
+    pct: env.pct,
+    allocCent: env.allocCent,
+    spentCent: env.spentCent,
+    leftCent: env.leftCent,
+    ratio: env.ratio,
+    state: env.state,
+    over: env.over,
+    overCent: env.overCent,
+    paceTick: B.envelopePaceTick(month, now),
+    closed: !!month.closedAt,
+    txns: rows,
+  };
+}
+
 /** Pending inline messages for the next settings render, then cleared. */
 const settingsMsg = {
   catError: "",
@@ -237,6 +296,18 @@ async function renderFull() {
     bindSyncStatus();
   } else if (ui.screen === "history") {
     app.innerHTML = R.renderHistoryScreen(await historyVM());
+  } else if (ui.screen === "category") {
+    const vm = await categoryVM();
+    // The category can vanish under us: a rollover closes the month and opens
+    // a fresh one whose snapshot may not carry this id, or a backup import
+    // replaces everything. Fall back to Home rather than render a blank shell.
+    if (!vm) {
+      ui.screen = "home";
+      ui.catId = null;
+      app.innerHTML = R.renderHome(await homeVM());
+    } else {
+      app.innerHTML = R.renderCategoryScreen(vm);
+    }
   } else {
     app.innerHTML = R.renderHome(await homeVM());
   }
@@ -289,7 +360,12 @@ function renderSheet() {
   const prev = document.querySelector(".sheet");
   let html;
   if (ui.sheet === "add") {
-    html = R.renderAddSheet({ categories: spendableCategories() });
+    html = R.renderAddSheet({
+      categories: spendableCategories(),
+      presetId: ui.addCatId,
+    });
+  } else if (ui.sheet === "edit") {
+    html = R.renderEditSheet(editVM());
   } else if (ui.sheet === "withdraw") {
     html = R.renderWithdrawSheet({ availableCent: ui.withdrawMaxCent ?? 0 });
   } else if (ui.sheet === "income") {
@@ -317,6 +393,11 @@ function renderSheet() {
 function openSheet(name) {
   ui.sheet = name;
   renderSheet();
+  if (name === "edit") {
+    // Retyping the amount is the common edit, so the existing figure comes up
+    // selected: one keystroke replaces it. Everything else is one tap away.
+    app.querySelector(".sheet-panel .amount-input")?.select?.();
+  }
 }
 
 /** The vault balance has to be read before the sheet can quote it. */
@@ -327,7 +408,384 @@ async function openWithdrawSheet() {
 
 function closeSheet() {
   ui.sheet = null;
+  ui.editId = null;
+  ui.editTxn = null;
+  ui.addCatId = null;
   renderSheet();
+}
+
+/* ------------------------------------------------------------------ *
+ * Edit a transaction
+ * ------------------------------------------------------------------ */
+
+/**
+ * Category chips for the edit sheet.
+ *
+ * Drawn from THIS TXN'S OWN MONTH snapshot, not from live settings — the same
+ * rule History's names follow. Editing a July row must offer July's
+ * categories, whatever Settings says today.
+ *
+ * VAULT CATEGORIES ARE FILTERED THE SAME WAY THE DATA LAYER REFUSES THEM:
+ * idb.planUpdate rejects any edit that crosses the vault boundary in either
+ * direction (error:"vault"), because budget.js classifies vault spend purely
+ * by categoryId. So a vault txn is offered only vault categories, and a
+ * spendable txn only spendable ones — an impossible move is never on screen.
+ */
+function editCategoryChoices(txn) {
+  const month = store.getMonth(txn?.monthKey);
+  const alloc = month?.alloc ?? [];
+  const list = alloc.length
+    ? alloc.map((a) => ({ id: a.id, name: a.name, vault: !!a.vault }))
+    : store.getCategories().map((c) => ({
+        id: c.id,
+        name: c.name,
+        vault: !!c.vault,
+      }));
+  const vaultIds = currentVaultIds();
+  const isVault = vaultIds.has(String(txn?.categoryId ?? ""));
+  const same = list.filter((c) => vaultIds.has(String(c.id)) === isVault);
+  // A txn filed against a category the snapshot no longer knows would leave
+  // the list empty and the sheet unusable — fall back to everything on the
+  // same side of the boundary, then to the whole list.
+  return same.length ? same : list;
+}
+
+function editVM() {
+  const t = ui.editTxn;
+  if (!t) return { categories: [] };
+  return {
+    id: t.id,
+    kind: t.kind,
+    ts: t.ts,
+    note: t.note ?? "",
+    categoryId: t.categoryId,
+    // Prefilled as a plain decimal, the same shape parseAmount reads back.
+    amountText: Number.isFinite(t.cent) ? String(t.cent / 100) : "",
+    categories: editCategoryChoices(t),
+    // idb.js refuses a date outside 2000..2100 (error:"date"). Handing the
+    // native picker the same window means the common mistake is prevented
+    // rather than reported.
+    dateMin: "2000-01-01",
+    dateMax: "2099-12-31",
+  };
+}
+
+/** Vault category ids, from settings — the set idb.updateTxn's guard wants. */
+function currentVaultIds() {
+  return new Set(
+    store
+      .getCategories()
+      .filter((c) => c.vault)
+      .map((c) => String(c.id)),
+  );
+}
+
+/**
+ * Open the edit sheet for a txn id, from EITHER the category screen or
+ * History.
+ *
+ * The record is read fresh from storage rather than from whatever the list was
+ * rendered with: the list could be seconds old, and the sheet is about to
+ * write against it. A sweep row is refused here as well as in the data layer
+ * (error:"kindlocked") so the sheet never opens on something unsavable.
+ */
+async function openEditSheet(id) {
+  if (!id) return;
+  const all = await idb.getAllTxns();
+  const rec = all.find((t) => t.id === id);
+  if (!rec) {
+    showToast("That transaction is no longer here", { kind: "error" });
+    await renderFull();
+    return;
+  }
+  if (rec.kind === "sweep") {
+    showToast("Month-close sweeps can't be edited — reopen the month instead", {
+      kind: "error",
+    });
+    return;
+  }
+  if (store.getMonth(rec.monthKey)?.closedAt) {
+    showToast("You can't edit a transaction in a closed month", {
+      kind: "error",
+    });
+    return;
+  }
+  ui.editId = id;
+  ui.editTxn = rec;
+  openSheet("edit");
+}
+
+/**
+ * Every branch of updateTxn's documented error union, as a sentence.
+ *
+ * A Map, not a switch — same reason sync.js's verb table is one: a plain
+ * object inherits `constructor`/`toString` from Object.prototype, so a code
+ * that happened to collide would resolve to a FUNCTION rather than falling to
+ * the default. (It also keeps error codes out of switch labels: the contract
+ * test reads every `case` in this file as a data-action handler, and an error
+ * code sitting in one reports as a dead button.)
+ *
+ * `onAmount` routes the message to the inline `.amount-error` under the field
+ * at fault; everything else is a condition the sheet cannot fix, so it closes
+ * and says why in a toast.
+ */
+const EDIT_ERRORS = new Map([
+  ["amount", { text: () => "Enter a valid amount", onAmount: true }],
+  [
+    "cap",
+    {
+      text: (res) =>
+        `Only ${fmt(res.capCent ?? 0)} is left in the vault \u2014 a withdrawal can't exceed it`,
+      onAmount: true,
+    },
+  ],
+  [
+    "date",
+    { text: () => "Pick a real date between 2000 and 2099", onAmount: true },
+  ],
+  [
+    "closed",
+    {
+      text: (res, label) =>
+        `You can't edit a transaction in a closed month \u2014 reopen ${label} from its income first`,
+      onAmount: false,
+    },
+  ],
+  [
+    "nomonth",
+    {
+      text: (res, label) =>
+        `There's no ${label} yet \u2014 set that month's income before moving anything into it`,
+      onAmount: false,
+    },
+  ],
+  [
+    "vault",
+    {
+      text: () =>
+        "Money can't cross between the vault and a spending category by editing \u2014 use Withdraw instead",
+      onAmount: false,
+    },
+  ],
+  [
+    "kind",
+    {
+      text: () =>
+        "An expense can't become a withdrawal \u2014 delete it and log it again",
+      onAmount: false,
+    },
+  ],
+  [
+    "kindlocked",
+    {
+      text: () =>
+        "Month-close sweeps can't be edited \u2014 reopen the month to reverse one",
+      onAmount: false,
+    },
+  ],
+  [
+    "deleted",
+    { text: () => "That transaction was already deleted", onAmount: false },
+  ],
+  [
+    "notfound",
+    { text: () => "That transaction is no longer here", onAmount: false },
+  ],
+  [
+    "guard",
+    {
+      text: () => "Couldn't check that edit was safe, so nothing was changed",
+      onAmount: false,
+    },
+  ],
+  [
+    "storage",
+    {
+      text: () =>
+        "This device refused to save the change \u2014 nothing was written",
+      onAmount: false,
+    },
+  ],
+]);
+
+/**
+ * @param {{error:string, monthKey?:string, capCent?:number}} res
+ * @returns {{message:string, onAmount:boolean}}
+ */
+function editErrorMessage(res) {
+  const label = res?.monthKey ? monthLabel(res.monthKey) : "that month";
+  // The fallback is for an error code added to idb.js after this was written:
+  // it must still say something a person can act on, never print the code.
+  const entry = EDIT_ERRORS.get(String(res?.error ?? ""));
+  if (!entry)
+    return { message: "That change couldn't be saved", onAmount: false };
+  return { message: entry.text(res ?? {}, label), onAmount: entry.onAmount };
+}
+
+/**
+ * Commit the edit sheet.
+ *
+ * Wrapped in guarded() by its caller, and it needs to be: the cap check awaits
+ * an IDB read before anything is written, so two taps inside that window both
+ * plan from the pre-write state — exactly the double-book the withdraw path
+ * was fixed for.
+ *
+ * All four guards are supplied. Every one of them fails CLOSED in idb.js, so
+ * omitting any turns every edit into error:"guard" — see its contract block.
+ */
+async function saveEdit() {
+  const panel = app.querySelector(".sheet-panel");
+  const id = ui.editId;
+  const original = ui.editTxn;
+  if (!id || !original) return;
+
+  const amountInput = panel?.querySelector(".amount-input");
+  const noteInput = panel?.querySelector(".note-input");
+  const dateInput = panel?.querySelector(".edit-date");
+
+  // Read on commit, never on input (RULE 2).
+  const cent = parseAmount(amountInput?.value ?? "");
+  if (cent == null || cent <= 0) {
+    R.showAmountError(panel, "Enter a valid amount");
+    amountInput?.focus();
+    return;
+  }
+
+  const categoryId = R.readEditCategory(panel) ?? original.categoryId;
+
+  // The date input hands back "YYYY-MM-DD" with no time. Keep the original
+  // clock time on the new day so a row edited from July 27 to July 3 stays in
+  // the same order relative to that day's other rows, and so a same-day
+  // "change" is a genuine no-op rather than a jump to midnight.
+  let ts = original.ts;
+  const dateText = dateInput?.value ?? "";
+  if (dateText && dateText !== R.dateInputValue(original.ts)) {
+    const next = tsForDate(dateText, original.ts);
+    if (next == null) {
+      R.showAmountError(panel, "Pick a real date between 2000 and 2099");
+      return;
+    }
+    ts = next;
+  }
+
+  R.clearAmountError(panel);
+
+  const all = await idb.getAllTxns();
+  const res = await idb.updateTxn(
+    id,
+    { cent, categoryId, note: noteInput?.value ?? "", ts },
+    {
+      isClosed: (monthKey) => !!store.getMonth(monthKey)?.closedAt,
+      vaultIds: currentVaultIds(),
+      monthExists: (monthKey) => !!store.getMonth(monthKey),
+      // MUST exclude the row being edited, or its own current amount is
+      // counted against itself and an unchanged withdrawal caps at zero.
+      maxWithdrawableFor: (next) =>
+        B.maxWithdrawable(
+          store.getMonths(),
+          all.filter((t) => t.id !== id),
+          next.monthKey,
+        ),
+    },
+  );
+
+  if (!res.ok) {
+    const { message, onAmount } = editErrorMessage(res);
+    if (onAmount) {
+      R.showAmountError(panel, message);
+      amountInput?.focus();
+    } else {
+      // A guard the sheet can't fix: close it, say why, and repaint from
+      // storage so the screen shows what is actually there.
+      closeSheet();
+      showToast(message, { kind: "error", duration: 5000 });
+      await renderFull();
+    }
+    return;
+  }
+
+  sync.kick();
+  closeSheet();
+  // Repaint from storage, NOT from res.txn: under concurrent writes the
+  // fallback path can hand back a record that disagrees with what landed
+  // (documented in idb.js). renderFull re-reads getTxns/getAllTxns.
+  await renderFull();
+  showToast(res.changed ? "Transaction updated" : "Nothing to change");
+}
+
+/**
+ * Combine a "YYYY-MM-DD" from the date input with an existing timestamp's
+ * clock time, in Manila.
+ *
+ * Date.parse("2026-07-03") is UTC midnight, which is 08:00 Manila — harmless
+ * until you ask which MONTH it belongs to, where a UTC-midnight July 1 is
+ * still July but a UTC-midnight Aug 1 read back as Aug 1 08:00 and a
+ * naive local parse of a first-of-month date can land in the previous month
+ * entirely. This solves for the offset instead of guessing it: build a
+ * candidate, ask money.js what Manila calls it, and correct by the difference.
+ *
+ * @returns {number|null} epoch ms, or null when the text isn't a real date
+ */
+function tsForDate(dateText, baseTs) {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(dateText));
+  if (!m) return null;
+  const [, y, mo, d] = m.map(Number);
+  if (mo < 1 || mo > 12 || d < 1 || d > 31) return null;
+
+  // Manila's wall-clock time on the original row, kept as-is.
+  let h = 12;
+  let min = 0;
+  let s = 0;
+  const base = new Date(Number(baseTs));
+  if (!Number.isNaN(base.getTime())) {
+    const parts = new Intl.DateTimeFormat("en-GB", {
+      timeZone: "Asia/Manila",
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+      hourCycle: "h23",
+    }).formatToParts(base);
+    const get = (t) => Number(parts.find((p) => p.type === t)?.value ?? 0);
+    h = get("hour") % 24;
+    min = get("minute");
+    s = get("second");
+  }
+
+  // Start from the UTC reading of those wall-clock parts, then correct by
+  // however far Manila actually sits from UTC at that instant. One pass is
+  // enough for a fixed-offset zone (+08:00, no DST since 1978).
+  let ts = Date.UTC(y, mo - 1, d, h, min, s);
+  if (!Number.isFinite(ts)) return null;
+  const offsetMs = manilaOffsetMs(ts);
+  ts -= offsetMs;
+  // Verify rather than trust: if the round-trip doesn't land on the requested
+  // civil date, refuse instead of silently filing the row on the wrong day.
+  if (R.dateInputValue(ts) !== dateText) return null;
+  return ts;
+}
+
+/** How far Asia/Manila is ahead of UTC at `ts`, in ms. */
+function manilaOffsetMs(ts) {
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Asia/Manila",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hourCycle: "h23",
+  }).formatToParts(new Date(ts));
+  const get = (t) => Number(parts.find((p) => p.type === t)?.value ?? 0);
+  const asUTC = Date.UTC(
+    get("year"),
+    get("month") - 1,
+    get("day"),
+    get("hour") % 24,
+    get("minute"),
+    get("second"),
+  );
+  return asUTC - ts;
 }
 
 /* ------------------------------------------------------------------ *
@@ -671,11 +1129,26 @@ async function importBackup(file) {
  * History
  * ------------------------------------------------------------------ */
 
+/**
+ * Delete a transaction. Reachable from History, the category screen, and the
+ * edit sheet's Delete button — one path for all three.
+ *
+ * undoTxn is the shared primitive and picks delete-vs-void off the STORED
+ * `synced` flag: a hard delete of a row the server already has strands it in
+ * the sheet forever, and a tombstone for a row it never saw is a void of
+ * nothing. Reimplementing that choice here is how the two halves drift.
+ */
 async function deleteFromHistory(id) {
   if (!id) return;
   if (!confirm("Delete this transaction? This cannot be undone.")) return;
+  // The edit sheet is one of the callers, so close it before the repaint —
+  // otherwise it stays open over a row that no longer exists.
+  if (ui.sheet === "edit") closeSheet();
   const ok = await undoTxn(id);
-  if (ok) showToast("Transaction deleted");
+  if (ok) {
+    sync.kick();
+    showToast("Transaction deleted");
+  }
   await renderFull();
 }
 
@@ -735,7 +1208,13 @@ async function runRollover() {
         deleted: 0,
       });
     }
-    if (closedAny && ui.screen === "home" && !ui.sheet) await renderFull();
+    if (
+      closedAny &&
+      (ui.screen === "home" || ui.screen === "category") &&
+      !ui.sheet
+    ) {
+      await renderFull();
+    }
   } finally {
     rolloverRunning = false;
   }
@@ -752,7 +1231,36 @@ app.addEventListener("click", (e) => {
 
   switch (a) {
     case "open-add":
+      ui.addCatId = null;
       openSheet("add");
+      break;
+    // The category screen's + and its empty-state CTA. Same sheet, same
+    // commit path — only the chip that starts selected differs, so the flow
+    // is amount -> one tap instead of amount -> find the chip -> tap.
+    case "open-add-for-cat":
+      ui.addCatId = el.getAttribute("data-cat-id");
+      openSheet("add");
+      break;
+    case "open-category":
+      ui.catId = el.getAttribute("data-cat-id");
+      ui.screen = "category";
+      renderFull();
+      break;
+    case "open-edit":
+      openEditSheet(el.getAttribute("data-id"));
+      break;
+    // Selection lives in the DOM, not in `ui` — patching two class lists is
+    // what keeps a half-typed amount and the iOS keyboard alive (RULE 1).
+    case "edit-pick-cat":
+      R.patchEditCategory(
+        app.querySelector(".sheet-panel"),
+        el.getAttribute("data-cat-id"),
+      );
+      break;
+    // Same shape as the other money writers: the cap check awaits an IDB read
+    // before writing, so an unguarded double-tap plans twice from stale state.
+    case "save-edit":
+      guarded(a, saveEdit);
       break;
     case "open-income":
       openSheet("income");
@@ -815,6 +1323,7 @@ app.addEventListener("click", (e) => {
     case "go-home":
       ui.screen = "home";
       ui.openMonth = null;
+      ui.catId = null;
       renderFull();
       break;
     default:

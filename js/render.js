@@ -35,20 +35,52 @@ function dtf(kind) {
   let f = dtfCache.get(kind);
   if (f) return f;
   const base = { timeZone: TZ };
-  f = new Intl.DateTimeFormat(
-    "en-PH",
-    kind === "day"
-      ? { ...base, month: "short", day: "numeric" }
-      : {
-          ...base,
-          month: "short",
-          day: "numeric",
-          hour: "numeric",
-          minute: "2-digit",
-        },
-  );
+  if (kind === "input") {
+    // en-CA formats as YYYY-MM-DD, which is exactly what <input type="date">
+    // wants — and it is Manila's civil date, not UTC's.
+    f = new Intl.DateTimeFormat("en-CA", {
+      ...base,
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+    });
+  } else {
+    f = new Intl.DateTimeFormat(
+      "en-PH",
+      kind === "day"
+        ? { ...base, month: "short", day: "numeric" }
+        : {
+            ...base,
+            month: "short",
+            day: "numeric",
+            hour: "numeric",
+            minute: "2-digit",
+          },
+    );
+  }
   dtfCache.set(kind, f);
   return f;
+}
+
+/**
+ * "2026-07-27" in Manila time — the value `<input type="date">` wants.
+ * toISOString() would be 8h behind and files an evening txn under yesterday.
+ * @param {number} ts
+ * @returns {string} "" when the timestamp is unusable
+ */
+export function dateInputValue(ts) {
+  // Number(null) and Number("") are both 0 — a finite number that formats as
+  // "1970-01-01" and lands in the input as a value OUTSIDE the min the field
+  // declares, which reads as a broken prefill rather than a missing one.
+  // Absent is not the epoch: return "" and let the field show empty.
+  if (ts == null || ts === "") return "";
+  const n = Number(ts);
+  if (!Number.isFinite(n)) return "";
+  try {
+    return dtf("input").format(new Date(n));
+  } catch {
+    return "";
+  }
 }
 
 /** "Jul 27" in Manila time — never toISOString(), which is 8h behind. */
@@ -143,7 +175,13 @@ function renderEnvRow(env, paceTick) {
   const overLine = env.over
     ? `<span class="env-over">Over by ${fmt(env.overCent)}</span>`
     : "";
-  return `<div class="env env--${esc(env.state)}" data-id="${esc(env.id)}">
+  // A <button>, not a div: the row opens the category screen, so it must be
+  // keyboard-reachable and announce what it does. The visible children already
+  // read as "Food · 30% · ₱6,500" to a screen reader, so the aria-label only
+  // has to add the verb.
+  return `<button class="env env--${esc(env.state)}" type="button"
+    data-action="open-category" data-cat-id="${esc(env.id)}" data-id="${esc(env.id)}"
+    aria-label="${esc(env.name)}, ${fmt(env.leftCent)} left">
     <span class="env-name">${esc(env.name)}</span>
     <div class="env-bar">
       <div class="env-fill" style="transform:scaleX(${fillRatio})"></div>
@@ -152,7 +190,7 @@ function renderEnvRow(env, paceTick) {
     <span class="env-pct">${pctLabel}%</span>
     <span class="env-amt amt">${fmt(env.leftCent)}</span>
     ${overLine}
-  </div>`;
+  </button>`;
 }
 
 function renderEnvelopes(envelopes, paceTick) {
@@ -225,25 +263,119 @@ export function renderHome(vm) {
  * @returns {string}
  */
 export function renderAddSheet(vm) {
-  const chips = (vm.categories || [])
+  const cats = vm.categories || [];
+  // `presetId` arrives from the category screen's add button: the category is
+  // already decided, so the sheet collapses to amount -> one tap. The chips
+  // stay (changing your mind must not need a back-out) with the preset marked
+  // — but a dedicated primary button means the common case never has to hunt
+  // for the right chip among six.
+  const preset = vm.presetId
+    ? cats.find((c) => String(c.id) === String(vm.presetId))
+    : null;
+
+  const chips = cats
     .map(
-      (c) => `<button class="chip" type="button" data-action="add-expense"
+      (c) => `<button class="chip${
+        preset && c.id === preset.id ? " chip--active" : ""
+      }" type="button" data-action="add-expense"
         data-cat-id="${esc(c.id)}">${esc(c.name)}</button>`,
     )
     .join("");
 
+  const title = preset ? `Add to ${esc(preset.name)}` : "Add expense";
+  const hint = preset
+    ? `Type the amount, then tap <b>Add to ${esc(preset.name)}</b> &mdash; or pick another category.`
+    : "Type the amount, then tap a category &mdash; that logs it.";
+  // DOM order puts the primary commit directly under the amount field, above
+  // the chips: with a preset the chips are the escape hatch, not the path.
+  const commit = preset
+    ? `<button class="btn btn-primary sheet-commit" type="button" data-action="add-expense"
+        data-cat-id="${esc(preset.id)}">Add to ${esc(preset.name)}</button>`
+    : "";
+
   return `<div class="sheet screen-add" role="dialog" aria-modal="true" aria-label="Add expense">
     <div class="sheet-backdrop" data-action="close-sheet"></div>
     <div class="sheet-panel">
-      <h2 class="sheet-title">Add expense</h2>
+      <h2 class="sheet-title">${title}</h2>
       <input class="amount-input amt" type="text" inputmode="decimal" placeholder="₱0"
         autocomplete="off" aria-label="Amount">
       <p class="amount-error" hidden></p>
-      <p class="sheet-hint">Type the amount, then tap a category &mdash; that logs it.</p>
+      <p class="sheet-hint">${hint}</p>
+      ${commit}
       <div class="chips">${chips}</div>
       <button class="btn btn-ghost" type="button" data-action="toggle-note">Add note</button>
       <div class="note-row" hidden>
         <input class="note-input" type="text" placeholder="Note (optional)" aria-label="Note">
+      </div>
+    </div>
+  </div>`;
+}
+
+/**
+ * Edit sheet — amount, category, note, date, plus Delete.
+ *
+ * `kind` is NOT offered: idb.updateTxn refuses a kind change outright (an
+ * expense cannot become a withdrawal), so putting it on screen would only
+ * teach the user to expect something the data layer will always refuse. The
+ * kind is stated as a read-only pill instead, using History's own vocabulary.
+ *
+ * NOTHING here commits on `input` (RULE 2). The amount and note are read off
+ * the DOM when Save is tapped; the category chips only toggle .chip--active
+ * through patchEditCategory, which touches two class lists and no more.
+ *
+ * @param {{id:string, kind:string, cent:number, categoryId:string,
+ *          note:string, ts:number, categories:{id:string,name:string}[],
+ *          dateMin?:string, dateMax?:string}} vm
+ * @returns {string}
+ */
+export function renderEditSheet(vm) {
+  const cats = Array.isArray(vm?.categories) ? vm.categories : [];
+  const currentId = String(vm?.categoryId ?? "");
+  const chips = cats
+    .map(
+      (c) => `<button class="chip${
+        String(c.id) === currentId ? " chip--active" : ""
+      }" type="button" data-action="edit-pick-cat"
+        data-cat-id="${esc(c.id)}" aria-pressed="${String(c.id) === currentId ? "true" : "false"}">${esc(c.name)}</button>`,
+    )
+    .join("");
+
+  // A withdrawal reads "Edit withdrawal", so the sheet never claims to be
+  // editing something it isn't. The tag repeats History's worded mark.
+  const kind = String(vm?.kind || "expense");
+  const kindWord =
+    kind === "withdrawal"
+      ? "withdrawal"
+      : kind === "income"
+        ? "refund"
+        : "expense";
+
+  return `<div class="sheet screen-edit" role="dialog" aria-modal="true" aria-label="Edit transaction">
+    <div class="sheet-backdrop" data-action="close-sheet"></div>
+    <div class="sheet-panel" data-id="${esc(vm?.id ?? "")}">
+      <h2 class="sheet-title">Edit ${esc(kindWord)} ${kindTag(kind)}</h2>
+      <input class="amount-input amt" type="text" inputmode="decimal" placeholder="₱0"
+        autocomplete="off" aria-label="Amount" value="${esc(vm?.amountText ?? "")}">
+      <p class="amount-error" hidden></p>
+
+      <div class="chips">${chips}</div>
+
+      <div class="note-row">
+        <input class="note-input" type="text" placeholder="Note (optional)"
+          aria-label="Note" value="${esc(vm?.note ?? "")}">
+      </div>
+
+      <label class="field edit-date-field">
+        <span class="field-label">Date</span>
+        <input class="edit-date" type="date" aria-label="Date"
+          min="${esc(vm?.dateMin ?? "")}" max="${esc(vm?.dateMax ?? "")}"
+          value="${esc(dateInputValue(vm?.ts))}">
+      </label>
+
+      <div class="edit-actions">
+        <button class="btn btn-primary" type="button" data-action="save-edit">Save changes</button>
+        <button class="btn btn-danger edit-delete" type="button" data-action="delete-txn"
+          data-id="${esc(vm?.id ?? "")}">Delete</button>
       </div>
     </div>
   </div>`;
@@ -526,16 +658,52 @@ function kindTag(kind) {
   return "";
 }
 
-function renderTxnRow(t) {
-  const note = t.note ? ` &middot; ${esc(t.note)}` : "";
+/**
+ * One transaction row — History's vocabulary, reused verbatim by the category
+ * screen. ONE builder, so the two lists can never drift into two dialects.
+ *
+ * `showCat:false` drops `.txn-cat` for the category screen, where every row is
+ * the same category and the name would be six identical words down the column.
+ * The note takes the space back (it becomes the row's only free text), which
+ * is the whole reason to drop it.
+ *
+ * The row body is a real <button>: the tap opens the edit sheet, so it has to
+ * be reachable by keyboard and announce itself. The delete × stays a sibling —
+ * `closest("[data-action]")` resolves to whichever is nearer, so a tap on ×
+ * never opens the sheet.
+ *
+ * @param {object} t
+ * @param {{showCat?:boolean}} [opts]
+ */
+function renderTxnRow(t, opts = {}) {
+  const showCat = opts.showCat !== false;
+  const noteText = t.note ? String(t.note) : "";
+  // With the category column gone the note stops being a trailing aside and
+  // becomes the row's label, so it drops the " · " lead-in that separated it
+  // from the name.
+  const note = noteText
+    ? showCat
+      ? ` &middot; ${esc(noteText)}`
+      : esc(noteText)
+    : "";
+  const cat = showCat
+    ? `<span class="txn-cat">${esc(t.categoryName || t.categoryId || "")}</span>`
+    : "";
+  // Escaped at the interpolation site below, not here: the label is assembled
+  // from raw text, so esc() has to be the LAST thing that touches it —
+  // escaping the note first would leave a literal "&amp;" in the label.
+  const label = `Edit ${fmt(t.cent)}${noteText ? ` — ${noteText}` : ""}`;
   return `<li class="list-row txn-row txn-row--${esc(t.kind || "expense")}" data-id="${esc(t.id)}">
-    <span class="list-row-main">
-      <span class="txn-date">${esc(shortDate(t.ts))}</span>
-      <span class="txn-cat">${esc(t.categoryName || t.categoryId || "")}</span>
-      ${kindTag(t.kind)}
-      <span class="txn-note">${note}</span>
-    </span>
-    <span class="list-row-amt amt">${fmt(t.cent)}</span>
+    <button class="txn-open" type="button" data-action="open-edit"
+      data-id="${esc(t.id)}" aria-label="${esc(label)}">
+      <span class="list-row-main">
+        <span class="txn-date">${esc(shortDate(t.ts))}</span>
+        ${cat}
+        ${kindTag(t.kind)}
+        <span class="txn-note">${note}</span>
+      </span>
+      <span class="list-row-amt amt">${fmt(t.cent)}</span>
+    </button>
     <button class="btn btn-danger txn-delete" type="button" data-action="delete-txn"
       data-id="${esc(t.id)}" aria-label="Delete transaction">&times;</button>
   </li>`;
@@ -598,6 +766,113 @@ export function renderHistoryScreen(vm) {
   return `<div class="screen screen-history">
     ${head}
     <ul class="list month-list">${rows}</ul>
+  </div>`;
+}
+
+/* -------------------------------------------------------------------- */
+/* Category detail                                                      */
+/* -------------------------------------------------------------------- */
+
+/**
+ * One category's month: the same envelope reading Home gives, plus the rows
+ * behind it.
+ *
+ * The header deliberately re-uses Home's bar vocabulary — `.env-bar`,
+ * `.env-fill`, `.env-tick`, the `env--state` modifier and the "Over by ₱x"
+ * pill — rather than inventing a second way to draw the same fact. Tapping an
+ * envelope on Home and landing on a chart that reads differently would make
+ * you re-learn the instrument on arrival.
+ *
+ * Allocated / spent / left are stated as three labelled figures because the
+ * bar alone answers "how far along", not "how much". This is the screen you
+ * open when the glance was not enough.
+ *
+ * @param {{id:string, name:string, monthLabel:string, pct:number,
+ *          allocCent:number, spentCent:number, leftCent:number, ratio:number,
+ *          state:string, over:boolean, overCent:number, paceTick:number,
+ *          txns:object[], closed?:boolean, canAdd?:boolean}} vm
+ * @returns {string}
+ */
+export function renderCategoryScreen(vm) {
+  // Kept RAW and esc()'d at each interpolation site, text and attribute
+  // alike — one rule, visible at every use, rather than a pre-escaped local
+  // the reader has to trace back to be sure of.
+  const name = String(vm?.name ?? "");
+  const fillRatio = num(vm?.ratio, 0, 1);
+  const tickPct = (num(vm?.paceTick, 0, 1) * 100).toFixed(2);
+  const pctLabel = Math.round(Number(vm?.pct) || 0);
+  const state = esc(vm?.state || "safe");
+  const txns = Array.isArray(vm?.txns) ? vm.txns : [];
+
+  const overLine = vm?.over
+    ? `<span class="env-over cat-over">Over by ${fmt(vm.overCent)}</span>`
+    : "";
+
+  // A closed month can't take a new row, and the data layer will refuse an
+  // edit anyway — so say so once, here, instead of letting every tap fail.
+  const closedNote = vm?.closed
+    ? `<p class="cat-closed-note">${esc(vm.monthLabel ?? "")} is closed &mdash; these
+        rows are the final record and can no longer be edited.</p>`
+    : "";
+
+  const addBtn = vm?.closed
+    ? ""
+    : `<button class="fab" type="button" data-action="open-add-for-cat"
+        data-cat-id="${esc(vm?.id ?? "")}" aria-label="Add to ${esc(name)}">+</button>`;
+
+  const body = txns.length
+    ? `<ul class="list txn-list cat-txn-list">${txns
+        .map((t) => renderTxnRow(t, { showCat: false }))
+        .join("")}</ul>`
+    : `<div class="empty cat-empty">
+        <span class="empty-glyph" aria-hidden="true">&#8369;</span>
+        <p class="empty-title">Nothing in ${esc(name)} yet</p>
+        <p class="empty-sub">${fmt(vm?.allocCent)} is allocated for
+          ${esc(vm?.monthLabel ?? "this month")} and none of it is spent.
+          Every ${esc(name)} expense you log lands here.</p>
+        ${
+          vm?.closed
+            ? ""
+            : `<button class="empty-cta btn btn-primary" type="button"
+                data-action="open-add-for-cat" data-cat-id="${esc(vm?.id ?? "")}">Add to ${esc(name)}</button>`
+        }
+      </div>`;
+
+  return `<div class="screen screen-category env--${esc(state)}">
+    <header class="topbar">
+      <button class="btn btn-ghost" type="button" data-action="go-home" aria-label="Back">&lsaquo;</button>
+      <h1 class="cat-title">${esc(name)}</h1>
+      <span class="cat-pct">${pctLabel}%</span>
+    </header>
+
+    <section class="cat-head">
+      <span class="cat-head-label">${esc(vm?.monthLabel ?? "")} &middot; left to spend</span>
+      <span class="cat-head-amt amt">${fmt(vm?.leftCent)}</span>
+      <div class="env-bar cat-bar">
+        <div class="env-fill" style="transform:scaleX(${fillRatio})"></div>
+        <div class="env-tick" style="left:${tickPct}%"></div>
+      </div>
+      ${overLine}
+      <dl class="cat-figures">
+        <div class="cat-figure">
+          <dt class="cat-figure-label">Allocated</dt>
+          <dd class="cat-figure-amt amt">${fmt(vm?.allocCent)}</dd>
+        </div>
+        <div class="cat-figure">
+          <dt class="cat-figure-label">Spent</dt>
+          <dd class="cat-figure-amt amt">${fmt(vm?.spentCent)}</dd>
+        </div>
+        <div class="cat-figure">
+          <dt class="cat-figure-label">Left</dt>
+          <dd class="cat-figure-amt amt">${fmt(vm?.leftCent)}</dd>
+        </div>
+      </dl>
+    </section>
+    ${closedNote}
+
+    <h2 class="cat-list-title">${esc(vm?.monthLabel ?? "")} transactions</h2>
+    ${body}
+    ${addBtn}
   </div>`;
 }
 
@@ -714,6 +989,43 @@ export function patchPctTotal(root) {
   const save = root?.querySelector('[data-action="save-categories"]');
   if (save) save.disabled = !parts.balanced;
   return parts.total;
+}
+
+/**
+ * Move the edit sheet's category selection to `catId`.
+ *
+ * The chosen category has to be visible before Save is tapped, and the ONLY
+ * honest place to keep it is the DOM — re-rendering the sheet to show a tick
+ * would blow away the half-typed amount and drop the keyboard (RULE 1). This
+ * touches two class lists and two aria-pressed flags, nothing else.
+ *
+ * @param {Element} panel  the `.sheet-panel` currently in the DOM
+ * @param {string} catId
+ * @returns {string|null} the id now selected
+ */
+export function patchEditCategory(panel, catId) {
+  const chips = [...(panel?.querySelectorAll(".chip") ?? [])];
+  if (!chips.length) return null;
+  const want = String(catId ?? "");
+  let picked = null;
+  for (const chip of chips) {
+    const on = chip.getAttribute("data-cat-id") === want;
+    chip.classList.toggle("chip--active", on);
+    chip.setAttribute("aria-pressed", on ? "true" : "false");
+    if (on) picked = want;
+  }
+  return picked;
+}
+
+/**
+ * Read the edit sheet's currently selected category off the DOM.
+ * Same reason as above: the selection lives in the markup, so this is the one
+ * source of truth when Save is tapped (RULE 2 — read on commit, not on input).
+ */
+export function readEditCategory(panel) {
+  return (
+    panel?.querySelector(".chip--active")?.getAttribute("data-cat-id") ?? null
+  );
 }
 
 /** Replace an inline settings error message without re-rendering the screen. */

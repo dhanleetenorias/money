@@ -162,7 +162,8 @@
   .screen-add,
   .screen-income,
   .screen-settings,
-  .screen-history {
+  .screen-history,
+  .screen-category {
     gap: var(--s4);
   }
 
@@ -1474,5 +1475,231 @@
     max-width: none;
     padding-block: var(--s3);
     padding-left: calc(1em + var(--s2));
+  }
+
+  /* ================================================================
+     PASS 3 — category detail + edit sheet.
+     Same rule as every pass before: no new hex values, only new pairings
+     of existing tokens. Nothing animates but transform and opacity.
+     ================================================================ */
+
+  /* ---------- Home envelope rows are now buttons ----------
+     The row opens its category, so it has to be a real <button>. The base
+     button rule resets background/border for us; these three lines undo the
+     inline-ish defaults so the flex row lays out exactly as the old <div>
+     did — same geometry, same alignment, no visual change on Home. */
+  .env {
+    width: 100%;
+    text-align: left;
+    padding-inline: 0;
+  }
+  /* Press feedback, matching .chip / .btn. Transform only. */
+  .env:active {
+    transform: scale(0.99);
+  }
+
+  /* ---------- category detail: the header ----------
+     Deliberately the SAME instrument as Home — .env-bar, .env-fill and
+     .env-tick are reused verbatim, and the screen carries the env--state
+     modifier so the fill hue, the hatch and the over pill all follow the
+     rules already established. Landing here from a Home row must not mean
+     re-learning the chart. */
+  .cat-title {
+    font-size: 17px;
+    font-weight: 700;
+    letter-spacing: -0.01em;
+  }
+  /* The allocation share, restated from the row that was tapped — the same
+     quiet identifier, in the same faint. faint on --bg: 6.1:1. */
+  .cat-pct {
+    font-size: 13px;
+    color: var(--faint);
+    font-variant-numeric: lining-nums tabular-nums;
+  }
+  .cat-head {
+    display: flex;
+    flex-direction: column;
+    gap: var(--s2);
+    padding: var(--s4);
+    border-radius: var(--r4);
+    background: var(--surface);
+    border: 1px solid var(--border);
+    animation: rise-in var(--t-overlay) var(--ease) backwards;
+  }
+  .cat-head-label {
+    font-size: 12px;
+    font-weight: 600;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    color: var(--faint); /* on --surface: 5.6:1 */
+  }
+  /* The answer, in the hero's voice but one step down — this is a detail
+     screen, not the dashboard. */
+  .cat-head-amt {
+    font-size: 34px;
+    font-weight: 700;
+    letter-spacing: -0.02em;
+    line-height: 1.05;
+  }
+  /* An overspent category says so in words on both screens. */
+  .screen-category.env--over .cat-head-amt {
+    color: var(--over);
+  }
+  .screen-category.env--caution .cat-head-amt {
+    color: var(--caution);
+  }
+  /* .env-bar carries `flex: 1` for Home's ROW, where that means "take the
+     leftover width". Inside this column it resolves against the cross axis
+     instead and collapsed the bar to 0px tall — a rail that renders as a
+     hairline. Restate both axes explicitly rather than relying on the parent's
+     direction. */
+  .cat-bar {
+    flex: none;
+    width: 100%;
+    height: 12px;
+    margin-top: var(--s2);
+  }
+  .cat-over {
+    align-self: flex-start;
+    margin-top: var(--s2);
+  }
+
+  /* Allocated / spent / left. The bar answers "how far along"; these answer
+     "how much", which is the question that brought you to this screen. A
+     three-up grid so the figures line up as one column set, tabular so they
+     compare at a glance. */
+  .cat-figures {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: var(--s2);
+    margin-top: var(--s3);
+    padding-top: var(--s3);
+    border-top: 1px solid color-mix(in srgb, var(--border) 60%, transparent);
+  }
+  .cat-figure {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    min-width: 0;
+  }
+  .cat-figure-label {
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    color: var(--faint);
+  }
+  .cat-figure-amt {
+    font-size: 15px;
+    font-weight: 600;
+    font-variant-numeric: lining-nums tabular-nums;
+  }
+  /* The third figure repeats the big number above it, so it recedes rather
+     than competing — it is here to complete the row, not to be read twice. */
+  .cat-figure:last-child .cat-figure-amt {
+    color: var(--dim); /* on --surface: 6.6:1 */
+  }
+
+  /* A closed month can't be added to or edited. Said once, here, instead of
+     letting every tap fail — the dashed rule is the same "the app did this,
+     not you" mark the sweep pill carries. */
+  .cat-closed-note {
+    font-size: 13px;
+    line-height: 1.5;
+    color: var(--dim);
+    padding: var(--s3);
+    border: 1px dashed color-mix(in srgb, var(--dim) 45%, var(--border));
+    border-radius: var(--r3);
+  }
+
+  .cat-list-title {
+    font-size: 12px;
+    font-weight: 700;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: var(--faint);
+    margin-bottom: calc(-1 * var(--s2));
+  }
+  /* History indents its rows under the month's chevron. There is no chevron
+     here, so the indent goes — the list is the screen, not a disclosure. */
+  .cat-txn-list {
+    padding-left: 0;
+  }
+  /* The empty state is a real one, but inside a screen that already has a
+     header — so it keeps the three registers and drops the full-height
+     centring that would push it off the fold. */
+  .cat-empty {
+    flex: 0 1 auto;
+    padding-block: var(--s5);
+  }
+
+  /* ---------- transaction rows are tappable ----------
+     The row body opens the edit sheet; the delete x stays its own button
+     beside it. Splitting them means `closest("[data-action]")` resolves to
+     whichever was actually hit, so x never opens the sheet. */
+  .txn-open {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--s3);
+    padding: 0;
+    text-align: left;
+    /* The <li> already provides the row's 48px; a second min-height here
+       would double the height of every row in History. */
+    min-height: 0;
+  }
+  .txn-open:active {
+    opacity: 0.7;
+  }
+
+  /* ---------- edit sheet ---------- */
+  /* The commit pair: Save leads, Delete sits beside it as a quiet danger
+     action rather than under a separate heading. Delete is deliberately not
+     full-width — destructive actions should not be the easiest target. */
+  .edit-actions {
+    display: flex;
+    align-items: center;
+    gap: var(--s2);
+    margin-top: var(--s4);
+  }
+  .edit-actions .btn-primary {
+    flex: 1;
+  }
+  .edit-delete {
+    flex: none;
+  }
+  /* The date field. `type=date` inherits the base 16px, so iOS never zooms
+     on focus, and the native picker does the validation the data layer would
+     otherwise refuse (min/max are set to idb.js's own 2000..2100 window). */
+  .edit-date-field {
+    margin-top: var(--s2);
+  }
+  .edit-date {
+    width: 100%;
+    min-height: var(--tap);
+    padding: 0 var(--s4);
+    background: var(--surface-2);
+    border-radius: var(--r3);
+    font-variant-numeric: lining-nums tabular-nums;
+  }
+  /* Safari renders the native indicator dark-on-dark by default. */
+  .edit-date::-webkit-calendar-picker-indicator {
+    opacity: 0.65;
+  }
+  /* The category chips in the edit sheet select rather than commit, so the
+     selected one has to look chosen and STAY chosen — .chip--active already
+     carries that treatment (accent inset ring + full text colour), and
+     aria-pressed carries it for anyone not looking. */
+  .screen-edit .chips {
+    padding-block: var(--s3);
+  }
+  /* With a preset category the add sheet grows a primary commit; it sits
+     directly under the amount so the common path is a straight line down
+     the sheet. */
+  .sheet-commit {
+    width: 100%;
+    margin-top: var(--s2);
   }
 }
