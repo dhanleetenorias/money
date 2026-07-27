@@ -19,7 +19,14 @@
     <title>Money</title>
     <link rel="icon" href="./favicon.png" type="image/png" />
     <link rel="manifest" href="./manifest.webmanifest" />
-    <link rel="apple-touch-icon" href="./icons/icon-180.png" />
+    <!-- iOS uses apple-touch-icon over anything in the manifest, and renders
+         alpha as BLACK — every icon here is opaque RGB. 180 is the size an
+         @3x iPhone actually wants; the larger ones are for the manifest and
+         for whatever crops the OS decides to do. -->
+    <link rel="apple-touch-icon" sizes="180x180" href="./icons/icon-180.png" />
+    <link rel="apple-touch-icon" sizes="192x192" href="./icons/icon-192.png" />
+    <link rel="apple-touch-icon" sizes="256x256" href="./icons/icon-256.png" />
+    <link rel="apple-touch-icon" sizes="512x512" href="./icons/icon-512.png" />
     <meta name="apple-mobile-web-app-capable" content="yes" />
     <meta name="apple-mobile-web-app-title" content="Money" />
     <meta

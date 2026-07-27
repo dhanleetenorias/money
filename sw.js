@@ -7,7 +7,7 @@
  * alone and an installed home-screen app keeps serving the stylesheet it
  * first installed, forever, no matter how many times the file changes.
  */
-const V = "money-2026-07-27c";
+const V = "money-2026-07-27d";
 
 const PRECACHE = [
   "./",
@@ -23,10 +23,13 @@ const PRECACHE = [
   "./js/toast.js",
   "./js/sw-register.js",
   "./manifest.webmanifest",
-  "./icons/icon-192.png",
-  // index.html's apple-touch-icon — the iOS home-screen icon. Without it here
-  // an offline install has no icon to fall back on.
+  // 180 is index.html's apple-touch-icon — the iOS home-screen icon. Without
+  // it here an offline install has no icon to fall back on. The larger sizes
+  // are what the manifest offers; the OS picks. 1024 is deliberately NOT
+  // precached: nothing requests it at install time and it's 60KB.
   "./icons/icon-180.png",
+  "./icons/icon-192.png",
+  "./icons/icon-512.png",
   "./favicon.png",
 ];
 
