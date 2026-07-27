@@ -15,7 +15,9 @@
     --surface: #16191a;
     --surface-2: #1e2224;
     --border: #2a2f31;
-    --track: #262b2d; /* bar rails — one step above surface-2 so fills pop */
+    --track: #2e3436; /* bar rails — lightest neutral step (1.52:1 on --bg):
+       the empty rail must read as "measurable length" at a glance, and the
+       page-coloured tick notches need it light enough to cut into. */
     --text: #f2f5f4; /* 17.5:1 on --bg */
     --dim: #9ba3a1; /* 7.5:1 on --bg, 6.2:1 on --surface-2 */
     --faint: #8a9391; /* 5.6:1 on --surface — AA at any size */
@@ -191,12 +193,13 @@
       transform: translateY(0);
     }
   }
+  /* Deliberately no `to` keyframe: the missing 100% frame resolves to the
+     element's computed transform — the inline scaleX(ratio) main.js sets.
+     Each bar grows from zero to its OWN fill. (With `to {scaleX(1)}` every
+     bar swept to full width, then snapped back to its real ratio.) */
   @keyframes bar-in {
     from {
       transform: scaleX(0);
-    }
-    to {
-      transform: scaleX(1);
     }
   }
   @keyframes fade-in {
@@ -280,7 +283,9 @@
   /* ---------- hero: the one number that matters ---------- */
   .hero {
     text-align: center;
-    padding-block: var(--s5) var(--s4);
+    /* Almost no bottom padding — the pace line below (a sibling) pulls
+       itself up with negative margin to sit tight under this number. */
+    padding-block: var(--s5) var(--s1);
     animation: rise-in var(--t-overlay) var(--ease) 60ms backwards;
   }
   .hero-label {
@@ -307,9 +312,14 @@
   }
 
   /* Pace verdict line. State is colour + wording (markup carries the words),
-     over additionally gains weight so it reads without colour. */
+     over additionally gains weight so it reads without colour. It is a
+     SIBLING of .hero, not a child — centre it explicitly or it sits
+     left-ragged under a centred number. Negative margin pulls it up against
+     the hero, cancelling most of the screen's s4 gap: it belongs to the
+     number above it, not to the envelope list below. */
   .pace {
-    margin-top: var(--s2);
+    text-align: center;
+    margin-top: calc(-1 * var(--s3));
     font-size: 13px;
     font-weight: 500;
   }
@@ -330,8 +340,10 @@
     flex-direction: column;
   }
 
-  /* Row: name | bar | amt | pct. Fixed side columns keep every bar starting
-     and ending on the same x — the bars read as one aligned instrument. */
+  /* Row: name | bar | pct | amt (DOM order — ₱-left lands at the hard right
+     edge where the eye expects the answer; the fixed % share sits inboard as
+     a quiet identifier). Fixed side columns keep every bar starting and
+     ending on the same x — the bars read as one aligned instrument. */
   .env {
     display: flex;
     align-items: center;
@@ -340,7 +352,9 @@
     animation: fade-in var(--t-small) var(--ease) backwards;
   }
   .env-name {
-    flex: 0 0 3.4em;
+    /* Wide enough for "Coffee"/"Buffer" at 14px without ellipsis — 3.4em
+       truncated real category names, which is fatal in a glance UI. */
+    flex: 0 0 4.6em;
     font-size: 14px;
     font-weight: 600;
     white-space: nowrap;
@@ -350,7 +364,7 @@
   .env-bar {
     position: relative;
     flex: 1;
-    height: 10px;
+    height: 12px;
     border-radius: 999px;
     background: var(--track);
     /* No overflow:hidden — the pace tick overhangs the bar on purpose. */
@@ -361,10 +375,15 @@
     border-radius: inherit;
     background: var(--safe);
     transform-origin: left center;
-    animation: bar-in 480ms var(--ease) backwards;
+    animation: bar-in 380ms var(--ease) backwards;
   }
+  /* Flex `order` pins the ₱-left column to the hard right edge even when the
+     over pill exists (DOM puts the pill last; visually it must sit inboard so
+     the amounts stay one aligned column across all rows). Visual order:
+     name · bar · [over pill] · pct · amt. */
   .env-amt {
     flex: 0 0 4.4em;
+    order: 3;
     text-align: right;
     font-size: 14px;
     font-weight: 600;
@@ -372,6 +391,7 @@
   }
   .env-pct {
     flex: 0 0 2.4em;
+    order: 2;
     text-align: right;
     font-size: 12px;
     color: var(--faint);
@@ -379,20 +399,22 @@
   }
 
   /* Pace tick: a ruler mark, not a stripe. A 2px light rule flanked by 2px
-     notches of page background, overhanging the bar 3px top and bottom —
-     the notch separates it from fill AND track, the overhang says "measured
-     against", and fill-vs-tick position reads as ahead/behind instantly. */
+     notches of page background, overhanging the bar 4px top and bottom —
+     the notch separates it from fill AND track (bg-vs-fill: 10.0:1 on safe,
+     11.5:1 on caution, 7.0:1 on over), the overhang says "measured against"
+     rather than "part of the bar", and fill-vs-tick position reads as
+     ahead/behind instantly. Core rule on track: 11.5:1. */
   .env-tick {
     position: absolute;
-    top: -3px;
-    bottom: -3px;
+    top: -4px;
+    bottom: -4px;
     width: 2px;
     transform: translateX(-50%);
     background: var(--text);
     border-inline: 2px solid var(--bg);
     background-clip: padding-box;
     box-sizing: content-box;
-    border-radius: 1px;
+    border-radius: 2px;
     pointer-events: none;
     z-index: 1;
   }
@@ -405,8 +427,11 @@
   .env--caution .env-fill {
     background: var(--caution);
   }
+  /* Weight shift is the non-colour half of the caution signal (plus the
+     fill-past-tick geometry, which needs no hue at all). */
   .env--caution .env-amt {
     color: var(--caution);
+    font-weight: 700;
   }
   .env--over .env-fill {
     background: var(--over);
@@ -423,7 +448,10 @@
     font-weight: 700;
   }
 
-  /* Tiny "over" pill — the explicit word, so state is never colour alone. */
+  /* Tiny "over" pill — the explicit word, so state is never colour alone.
+     DOM-last, but order:0 places it visually between bar and the number
+     columns, so the ₱ column stays aligned across every row. It borrows
+     width from the bar (flex:1), which is fine — an over bar is full anyway. */
   .env-over {
     flex: none;
     font-size: 10px;
@@ -436,38 +464,41 @@
     padding: 1px var(--s2);
   }
 
-  /* Load stagger: rows settle top-to-bottom, 45ms apart. */
+  /* Load stagger: rows settle top-to-bottom, 30ms apart. Deliberately tight:
+     home fully re-renders after EVERY logged expense, so this entrance plays
+     many times a day — it must read as the bars settling into place, never
+     as an intro he waits through. Worst-case last-row delay: 90+30·7=300ms. */
   .env:nth-child(1),
   .env:nth-child(1) .env-fill {
-    animation-delay: 120ms;
+    animation-delay: 90ms;
   }
   .env:nth-child(2),
   .env:nth-child(2) .env-fill {
-    animation-delay: 165ms;
+    animation-delay: 120ms;
   }
   .env:nth-child(3),
   .env:nth-child(3) .env-fill {
-    animation-delay: 210ms;
+    animation-delay: 150ms;
   }
   .env:nth-child(4),
   .env:nth-child(4) .env-fill {
-    animation-delay: 255ms;
+    animation-delay: 180ms;
   }
   .env:nth-child(5),
   .env:nth-child(5) .env-fill {
-    animation-delay: 300ms;
+    animation-delay: 210ms;
   }
   .env:nth-child(6),
   .env:nth-child(6) .env-fill {
-    animation-delay: 345ms;
+    animation-delay: 240ms;
   }
   .env:nth-child(7),
   .env:nth-child(7) .env-fill {
-    animation-delay: 390ms;
+    animation-delay: 270ms;
   }
   .env:nth-child(n + 8),
   .env:nth-child(n + 8) .env-fill {
-    animation-delay: 435ms;
+    animation-delay: 300ms;
   }
 
   /* ---------- FAB ---------- */
@@ -488,7 +519,11 @@
     display: flex;
     align-items: center;
     justify-content: center;
-    box-shadow: var(--shadow-raise);
+    /* Inset top highlight gives the disc a lit edge so it separates from
+       whatever scrolls beneath it on OLED black. Static, never animated. */
+    box-shadow:
+      inset 0 1px 0 rgba(255, 255, 255, 0.28),
+      var(--shadow-float);
     transition: transform var(--t-micro) var(--ease);
   }
   .fab:active {

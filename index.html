@@ -6,16 +6,10 @@
       name="viewport"
       content="width=device-width,initial-scale=1,viewport-fit=cover"
     />
-    <meta
-      name="theme-color"
-      media="(prefers-color-scheme: dark)"
-      content="#0d0f0e"
-    />
-    <meta
-      name="theme-color"
-      media="(prefers-color-scheme: light)"
-      content="#f2f4f3"
-    />
+    <!-- One colour for both schemes: the app is dark regardless of the phone's
+         setting, so a light theme-color would tint the status bar white above
+         a dark page. -->
+    <meta name="theme-color" content="#0d0f0e" />
     <title>Money</title>
     <link rel="icon" href="./favicon.png" type="image/png" />
     <link rel="manifest" href="./manifest.webmanifest" />
@@ -35,22 +29,17 @@
     />
     <link rel="stylesheet" href="./app.css" />
     <style>
-      /* Boot splash only. Must track app.css's two palettes or a light-mode
-         phone flashes a dark page before the stylesheet applies. */
+      /* Boot splash only — matches app.css's --bg so there's no flash before
+         the stylesheet applies. This block is UNLAYERED, so it outranks every
+         @layer rule in app.css no matter how specific those are: a light
+         override lived here after the light palette was deleted, and it
+         repainted the page white under text still tuned for dark. If --bg
+         changes, change it here too. */
       html,
       body {
         background: #0d0f0e;
         margin: 0;
         height: 100%;
-      }
-      @media (prefers-color-scheme: light) {
-        html,
-        body {
-          background: #f2f4f3;
-        }
-        #app-boot {
-          color: #047857;
-        }
       }
       #app-boot {
         position: fixed;

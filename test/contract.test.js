@@ -385,6 +385,24 @@ test("no input is styled below 16px", () => {
   );
 });
 
+test("index.html ships one palette too", () => {
+  // The boot-splash <style> in index.html is UNLAYERED, so it beats every
+  // @layer rule in app.css regardless of specificity. A light override
+  // survived there after the light palette was deleted from app.css and
+  // repainted the whole page white under text still tuned for dark — the app
+  // looked broken while every CSS token was correct.
+  // Only the <style> block matters. The `theme-color` <meta> tags legitimately
+  // branch on colour scheme — they tint the iOS status bar, they don't paint
+  // the page.
+  const style = /<style>([\s\S]*?)<\/style>/.exec(read("../index.html"))?.[1];
+  assert.ok(style, "index.html should still carry its boot-splash <style>");
+  assert.doesNotMatch(
+    style,
+    /prefers-color-scheme:\s*light/,
+    "the boot <style> carries a light override — it outranks app.css's layers",
+  );
+});
+
 test("app.css ships one palette", () => {
   // Dark-only was a deliberate call: one palette tuned hard beats two tuned
   // adequately. A stray light block would go unverified and drift.

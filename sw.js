@@ -7,7 +7,7 @@
  * alone and an installed home-screen app keeps serving the stylesheet it
  * first installed, forever, no matter how many times the file changes.
  */
-const V = "money-2026-07-27e";
+const V = "money-2026-07-27f";
 
 const PRECACHE = [
   "./",
