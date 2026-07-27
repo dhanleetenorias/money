@@ -228,6 +228,17 @@
       transform: translateY(0);
     }
   }
+  /* Breathing opacity for "work in flight" marks (sync dot, busy buttons).
+     Opacity only — compositor-safe, and reads as a heartbeat, not a spinner:
+     this app's waits are sub-second background pushes, not page loads. */
+  @keyframes pulse-breathe {
+    from {
+      opacity: 1;
+    }
+    to {
+      opacity: 0.35;
+    }
+  }
 
   /* ---------- topbar chips ---------- */
   .month-chip {
@@ -575,6 +586,15 @@
     font-weight: 700;
     margin-bottom: var(--s4);
   }
+  /* One-line coaching under the amount field (add sheet). Quiet — it's for
+     the first week of use, then the muscle memory takes over.
+     faint on --surface: 5.6:1. */
+  .sheet-hint {
+    font-size: 13px;
+    color: var(--faint);
+    text-align: center;
+    line-height: 1.4;
+  }
 
   /* ---------- amount entry ---------- */
   .amount-input {
@@ -592,15 +612,15 @@
     color: var(--faint);
   }
 
+  /* WRAP, don't scroll. Five categories overflowed a 390px row by 13px, so
+     "Misc" sat half off-screen — which reads as a broken row, and hides a
+     category behind a swipe on the fastest path in the app. Wrapping costs
+     one line and shows every option. */
   .chips {
     display: flex;
+    flex-wrap: wrap;
     gap: var(--s2);
-    overflow-x: auto;
     padding-block: var(--s2);
-    scrollbar-width: none;
-  }
-  .chips::-webkit-scrollbar {
-    display: none;
   }
   .chip {
     flex: none;
@@ -697,6 +717,40 @@
     font-size: 14px;
     font-weight: 500;
   }
+  /* Success vs error must not look identical. Both lead with a GLYPH — the
+     ✓ / ! is the signal, hue only reinforces (deuteranopia-safe). The glyph
+     sits in a small tinted disc so it reads at arm's length.
+     safe on --surface-2: 8.3:1 · over on --surface-2: 5.8:1. */
+  .toast--success .toast-msg::before,
+  .toast--error .toast-msg::before {
+    content: "\2713"; /* ✓ */
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 20px;
+    height: 20px;
+    margin-right: var(--s2);
+    border-radius: 50%;
+    font-size: 12px;
+    font-weight: 700;
+    vertical-align: -0.25em;
+    color: var(--safe);
+    background: color-mix(in srgb, var(--safe) 14%, var(--surface-2));
+  }
+  .toast--success {
+    border-color: color-mix(in srgb, var(--safe) 35%, var(--border));
+  }
+  .toast--error .toast-msg::before {
+    content: "!";
+    color: var(--over);
+    background: color-mix(in srgb, var(--over) 14%, var(--surface-2));
+  }
+  .toast--error {
+    border-color: color-mix(in srgb, var(--over) 45%, var(--border));
+  }
+  .toast--error .toast-msg {
+    font-weight: 600;
+  }
   .toast-action {
     flex: none;
     min-height: 40px;
@@ -707,24 +761,56 @@
     color: var(--accent);
   }
 
-  /* ---------- empty state ---------- */
+  /* ---------- empty state ----------
+     A first-run screen is the one moment the app explains itself, so it gets
+     three registers: a large quiet glyph (decorative, aria-hidden), a titled
+     statement in full text colour, and one sentence of why in dim. The CTA
+     is the only saturated thing on screen — nothing competes with the next
+     step. */
   .empty {
     flex: 1;
     display: flex;
     flex-direction: column;
     align-items: center;
     justify-content: center;
-    gap: var(--s4);
+    gap: var(--s3);
     text-align: center;
     padding: var(--s6) var(--s5);
     animation: rise-in var(--t-overlay) var(--ease) backwards;
   }
+  /* Glyph sits in a soft disc so it reads as illustration, not stray text.
+     faint on --surface: 5.6:1 — but it's aria-hidden decoration anyway. */
+  .empty-glyph {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 64px;
+    height: 64px;
+    border-radius: 50%;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    font-size: 26px;
+    line-height: 1;
+    color: var(--faint);
+    margin-bottom: var(--s2);
+  }
   .empty-title {
-    font-size: 17px;
-    font-weight: 600;
+    font-size: 19px;
+    font-weight: 700;
+    letter-spacing: -0.01em;
+    color: var(--text); /* 17.5:1 on --bg */
+    max-width: 22ch;
+    line-height: 1.3;
+  }
+  /* The explanation recedes: dim on --bg 7.5:1. */
+  .empty-sub {
+    font-size: 14px;
     color: var(--dim);
-    max-width: 24ch;
-    line-height: 1.4;
+    max-width: 30ch;
+    line-height: 1.5;
+  }
+  .empty .empty-cta {
+    margin-top: var(--s2);
   }
   .empty-cta {
     min-height: var(--tap);
@@ -798,6 +884,16 @@
     padding-block: var(--s1);
   }
 
+  /* ---------- shared: a button with a request in flight ----------
+     STYLED, NOT YET WIRED: main.js is a later phase. When it toggles
+     .btn--busy on e.g. the Test-connection button, the label breathes
+     (opacity only) and taps stop landing — no spinner, matching the sync
+     dot's heartbeat language. Until then this rule is inert. */
+  .btn--busy {
+    pointer-events: none;
+    animation: pulse-breathe 900ms var(--ease) infinite alternate;
+  }
+
   /* ---------- shared: a deliberately disabled button ----------
      Not a ghost of the enabled state — its own state: flat well, no
      accent, no press feedback, but the label stays readable.
@@ -833,6 +929,14 @@
     color: var(--dim);
     border: 1px solid var(--border);
     vertical-align: 0.1em;
+  }
+
+  /* "WITHDRAWAL" at full tracking is 97px — wider than the category name it
+     sits beside, and enough to overflow a 390px row. Tightened here only;
+     the month pills have the whole row to themselves. */
+  .txn-tag {
+    letter-spacing: 0.02em;
+    padding-inline: 6px;
   }
 
   /* ---------- vault card additions ---------- */
@@ -876,6 +980,13 @@
      a first-class gate, not an optional afterthought. */
   .screen-withdraw .amount-input {
     caret-color: var(--vault);
+  }
+
+  /* The income sheet's Save matches the withdraw submit's full-width form —
+     one commit affordance shape across every sheet that has one. */
+  .screen-income .btn-primary {
+    width: 100%;
+    margin-top: var(--s3);
   }
 
   /* Available balance — the vault card's language, condensed to one line.
@@ -939,23 +1050,32 @@
   }
 
   /* ---------- settings ----------
-     Hairlines and rhythm, not boxes — sections separate by space. */
+     Home speaks in cards (the vault); Settings adopts the same register:
+     each section is a quiet surface card, staggered in like the envelope
+     rows so the screen settles rather than pops. The percentage editor is
+     the centrepiece and its verdict band (below) is the loudest thing here. */
   .settings-section {
     display: flex;
     flex-direction: column;
     gap: var(--s2);
+    padding: var(--s4);
+    border-radius: var(--r4);
+    background: var(--surface);
+    border: 1px solid color-mix(in srgb, var(--border) 70%, transparent);
+    animation: rise-in var(--t-overlay) var(--ease) backwards;
   }
-  .settings-section + .settings-section {
-    margin-top: var(--s2);
-    padding-top: var(--s4);
-    border-top: 1px solid color-mix(in srgb, var(--border) 55%, transparent);
+  .settings-section:nth-of-type(2) {
+    animation-delay: 40ms;
+  }
+  .settings-section:nth-of-type(3) {
+    animation-delay: 80ms;
   }
   .settings-title {
     font-size: 12px;
     font-weight: 600;
     letter-spacing: 0.08em;
     text-transform: uppercase;
-    color: var(--faint); /* on --bg: 6.1:1 dark · 4.6:1 light */
+    color: var(--faint); /* on --surface: 5.6:1 */
   }
   /* Explanatory copy / inline messages. Words carry the state; the error
      and notice hues only reinforce. over on --bg: 7.0:1 · 5.9:1;
@@ -1031,42 +1151,73 @@
     color: var(--faint);
   }
 
-  /* The 100% gate. A totals row under the column, value aligned with the
-     input wells. State is never colour alone: balanced appends a check,
-     unbalanced appends "!", and the number itself shows the arithmetic.
-     A disabled Save (rule above) completes the same statement. */
+  /* The 100% gate — the centrepiece of this screen, so it reads as a VERDICT
+     BAND, not a table row: a tinted strip under the column whose whole
+     surface flips with the state. Three non-colour signals agree with the
+     hue: the ✓/! mark, the worded delta ("3% left to place" / "2% over" /
+     "adds up"), and the Save button's disabled state below. The number stays
+     aligned with the input wells so the arithmetic reads down one column.
+     safe on 10% safe-tint over --bg: 8.5:1 · over on its tint: 6.2:1 —
+     both AA at any size. */
   .cat-total {
     display: flex;
     align-items: center;
     gap: var(--s2);
     min-height: var(--tap);
-    border-top: 1px solid var(--border);
+    margin-top: var(--s1);
+    padding-inline: var(--s3);
+    border-radius: var(--r2);
     font-size: 15px;
     font-weight: 700;
+    background: color-mix(in srgb, var(--safe) 10%, var(--bg));
+    border: 1px solid color-mix(in srgb, var(--safe) 30%, var(--border));
   }
   .cat-total-label {
     flex: none;
   }
+  /* The worded delta — the instruction, not just the verdict. It inherits
+     the band's state colour but drops weight so the ₱-style number stays
+     the loudest thing on the row. */
+  .cat-total-delta {
+    flex: 1;
+    min-width: 0;
+    font-size: 12px;
+    font-weight: 600;
+    text-align: right;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
   .cat-total-value {
-    margin-left: auto;
-    padding-right: var(--s3); /* mirrors the wells' inner padding */
+    flex: none;
   }
   .cat-total::after {
     flex: none;
     width: 1.2em;
     font-size: 13px;
+    text-align: center;
   }
   .cat-total--ok {
-    color: var(--safe); /* on --bg: 10.0:1 dark · 5.0:1 light */
+    color: var(--safe); /* on the 10% tint: 8.5:1 */
   }
   .cat-total--ok::after {
     content: "\2713"; /* ✓ */
   }
   .cat-total--bad {
-    color: var(--over); /* on --bg: 7.0:1 dark · 5.9:1 light */
+    color: var(--over); /* on the 10% tint: 6.2:1 */
+    background: color-mix(in srgb, var(--over) 10%, var(--bg));
+    border-color: color-mix(in srgb, var(--over) 35%, var(--border));
   }
   .cat-total--bad::after {
     content: "!";
+  }
+  /* A disabled Save under an unbalanced column is DELIBERATE, and it says
+     so: dashed border, flat well, readable label (the shared .btn[disabled]
+     handles colour). The dash is the non-colour "not yet" mark — it reads
+     as an outline of the button that will exist once the total adds up. */
+  .settings-section .btn-primary[disabled] {
+    border: 1px dashed var(--track);
+    background: transparent;
   }
 
   /* Sync form fields: the note-input well language, labelled. */
@@ -1091,10 +1242,12 @@
     color: var(--faint);
   }
 
-  /* Sync status: quiet when healthy, legible when not. Plain dim facts
-     ("Configured · 0 pending · Last sync …"); the off state warms to
-     caution (word carries it — caution on --bg: 11.5:1 · 4.8:1) and an
-     error breaks onto its own line in over + weight. */
+  /* Sync status: quiet when healthy, legible when not. A dot + a WORD lead
+     ("● Connected · Last sync …") — the word always carries the state, the
+     dot only echoes it. Errors break onto their own line in over + weight.
+     While a push is in flight the dot breathes (opacity-only animation) —
+     the app's one live "work happening" indicator, driven by patchSyncStatus
+     off sync.onChange. */
   .sync-status {
     display: flex;
     flex-wrap: wrap;
@@ -1109,13 +1262,35 @@
     flex: none;
   }
   .sync-stat--off {
-    color: var(--caution);
+    color: var(--caution); /* on --bg: 11.5:1 — word carries the state */
     font-weight: 600;
+  }
+  .sync-stat--bad {
+    color: var(--over); /* on --bg: 7.0:1 */
+    font-weight: 600;
+  }
+  .sync-dot {
+    flex: none;
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    margin-right: calc(-1 * var(--s1)); /* tucks against its word */
+    background: var(--faint);
+  }
+  .sync-dot--ok {
+    background: var(--safe);
+  }
+  .sync-dot--err {
+    background: var(--over);
+  }
+  .sync-dot--busy {
+    background: var(--vault);
+    animation: pulse-breathe 900ms var(--ease) infinite alternate;
   }
   .sync-error {
     flex-basis: 100%;
     font-weight: 600;
-    color: var(--over); /* on --bg: 7.0:1 dark · 5.9:1 light */
+    color: var(--over); /* on --bg: 7.0:1 */
     overflow-wrap: anywhere;
   }
 
@@ -1155,14 +1330,32 @@
     flex: none;
     font-weight: 600;
   }
+  /* Open vs closed is worded (the pill) AND textural: the open pill is an
+     outline, the closed pill a FILLED well — a shape/fill difference that
+     survives any colour deficiency. safe on --bg: 10.0:1. */
   .month-state--open {
     color: var(--safe);
     border-color: color-mix(in srgb, var(--safe) 45%, var(--border));
   }
-  /* closed months keep the quiet dim pill from the shared base */
+  .month-state--closed {
+    color: var(--dim); /* on --surface-2: 6.2:1 */
+    background: var(--surface-2);
+    border-color: transparent;
+  }
+  /* A closed month is the archive, not the present: its name drops to dim
+     (7.5:1 on --bg — still comfortably readable) so the one open month
+     stands out by weight of ink, not colour. */
+  .month-item--closed .month-name {
+    color: var(--dim);
+  }
+  .month-item--closed .month-head .list-row-amt {
+    color: var(--dim);
+    font-weight: 500;
+  }
   .month-swept {
     color: var(--vault);
     border-color: color-mix(in srgb, var(--vault) 45%, var(--border));
+    border-style: dashed; /* same colour-free mark as the sweep txn rows */
   }
 
   /* Transactions. Indented one chevron-width so they nest under the month
@@ -1183,15 +1376,27 @@
     align-items: center;
     gap: var(--s2);
   }
+  /* "Jul 27" needs ~3.4em. At 2.2em it was clipped to "Jul 2" and ran into
+     the category name — sized to the content it actually holds. */
   .txn-date {
     flex: none;
-    width: 2.2em;
+    width: 3.4em;
     font-size: 12px;
     color: var(--faint); /* on --bg: 6.1:1 dark · 4.6:1 light */
     font-variant-numeric: lining-nums tabular-nums;
   }
+  /* Shrink order in a crowded row: the NOTE gives way first (it's optional
+     colour), then the category name — but the name keeps enough room to stay
+     a word. `flex: none` made the row overflow and pushed the pill under the
+     amount; `min-width: 0` fixed the overflow but crushed "Save/Invest" to
+     "S.", which is worse than a truncated note. 5.5em holds ~9 characters. */
   .txn-cat {
-    flex: none;
+    flex: 0 1 auto;
+    /* ch, not em: this floor exists to hold a readable number of CHARACTERS,
+       and em is the font's design size, not its digit width. 5.5em resolved
+       to a hard 77px that no longer fit once the pill and date were sized
+       correctly, so the row overflowed instead of the name ellipsising. */
+    min-width: 6ch;
     max-width: 40%;
     font-size: 14px;
     font-weight: 600;
@@ -1211,15 +1416,35 @@
 
   /* Kind marks. Ordinary spends carry no pill; the others get a worded
      one — the WORD distinguishes them, and the border style (withdrawal
-     solid vs sweep dashed) is a second colour-free cue for anyone who
-     can't split the hues. */
+     FILLED, sweep DASHED, refund outline) is a second colour-free cue for
+     anyone who can't split the hues. */
+
+  /* Withdrawal: vault language, and the pill is a filled well — the same
+     "banked money" surface as the vault card, shrunk to a mark.
+     vault on 13% vault-tint over --surface: 5.7:1. */
   .txn-tag--withdrawal {
     color: var(--vault);
+    background: color-mix(in srgb, var(--vault) 13%, var(--surface));
     border-color: color-mix(in srgb, var(--vault) 45%, var(--border));
   }
+  /* A withdrawal row also carries a vault-blue inset edge at the left — the
+     structural cue that this row is vault money, visible before the pill is
+     even read. Static, never animated. */
+  .txn-row--withdrawal {
+    box-shadow: inset 3px 0 0 color-mix(in srgb, var(--vault) 55%, transparent);
+    padding-left: var(--s2);
+  }
+  /* Sweep: bookkeeping, not spending. Dashed pill + the whole row recedes —
+     dim date/category/amount (dim on --bg: 7.5:1, still AA) says "the app
+     did this", distinct from anything he typed. */
   .txn-tag--sweep {
     border-style: dashed;
     border-color: color-mix(in srgb, var(--dim) 45%, var(--border));
+  }
+  .txn-row--sweep .txn-cat,
+  .txn-row--sweep .list-row-amt {
+    color: var(--dim);
+    font-weight: 500;
   }
   .txn-tag--income {
     color: var(--safe);
@@ -1238,8 +1463,14 @@
     margin-right: calc(-1 * var(--s2));
   }
 
+  /* Inline "no transactions" line inside an expanded month. It shares
+     .empty-title's class (markup contract) but must NOT inherit the big
+     first-run voice — inside a list it's a footnote, not a headline.
+     dim on --bg: 7.5:1. */
   .txn-empty {
     font-size: 14px;
+    font-weight: 500;
+    color: var(--dim);
     max-width: none;
     padding-block: var(--s3);
     padding-left: calc(1em + var(--s2));

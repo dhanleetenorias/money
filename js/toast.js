@@ -44,12 +44,19 @@ export function initToast(root) {
 
 /**
  * @param {string} message
- * @param {{actionLabel?:string, onAction?:Function, duration?:number}} [opts]
+ * @param {{actionLabel?:string, onAction?:Function, duration?:number,
+ *          kind?:'success'|'error'}} [opts]
  * @returns {void}
  */
 export function showToast(message, opts = {}) {
   if (!els) return; // initToast() must run first — fail quiet, never throw
   clearTimeout(hideTimer);
+
+  // Success and error must not look identical. Callers pass kind:'success'
+  // or kind:'error'; no kind keeps the neutral base look. CSS renders the
+  // difference as a leading glyph + border treatment, never colour alone.
+  els.root.classList.toggle("toast--error", opts.kind === "error");
+  els.root.classList.toggle("toast--success", opts.kind === "success");
 
   els.msg.textContent = message;
   if (opts.actionLabel && typeof opts.onAction === "function") {

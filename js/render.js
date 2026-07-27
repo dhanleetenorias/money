@@ -179,7 +179,10 @@ export function renderHome(vm) {
         ${nav}
       </header>
       <div class="empty">
-        <p class="empty-title">Set your income for ${esc(vm.monthLabel)} to get started</p>
+        <span class="empty-glyph" aria-hidden="true">&#8369;</span>
+        <p class="empty-title">Set your income for ${esc(vm.monthLabel)}</p>
+        <p class="empty-sub">One number starts the month &mdash; your split, your
+          vault and today&#39;s safe-to-spend all come from it.</p>
         <button class="empty-cta btn btn-primary" type="button" data-action="open-income">Set income</button>
       </div>
     </div>`;
@@ -236,6 +239,7 @@ export function renderAddSheet(vm) {
       <input class="amount-input amt" type="text" inputmode="decimal" placeholder="₱0"
         autocomplete="off" aria-label="Amount">
       <p class="amount-error" hidden></p>
+      <p class="sheet-hint">Type the amount, then tap a category &mdash; that logs it.</p>
       <div class="chips">${chips}</div>
       <button class="btn btn-ghost" type="button" data-action="toggle-note">Add note</button>
       <div class="note-row" hidden>
@@ -328,22 +332,73 @@ function renderPctRow(cat) {
 }
 
 /**
+ * Shared arithmetic for the 100% gate — used by the initial render AND by
+ * patchPctTotal, so the live-typed state and the fresh render can never
+ * disagree. `scaled` is the total in millionths of a percent (the same
+ * integer space store.validateCategories compares in).
+ *
+ * The delta line is what makes the state read instantly: not just "97%" in
+ * red, but "3% left to place" / "2.5% over" — the number tells you which way
+ * to move, and the words carry the state without colour.
+ */
+function pctTotalParts(scaled) {
+  const total = scaled / 1e6;
+  const balanced = scaled === 100 * 1e6;
+  const totalText = Number.isInteger(total) ? String(total) : total.toFixed(2);
+  let deltaText = "adds up";
+  if (!balanced) {
+    const diff = Math.abs(100 * 1e6 - scaled) / 1e6;
+    const diffText = Number.isInteger(diff) ? String(diff) : diff.toFixed(2);
+    deltaText =
+      scaled < 100 * 1e6 ? `${diffText}% left to place` : `${diffText}% over`;
+  }
+  return { total, balanced, totalText, deltaText };
+}
+
+/**
  * The sync status block. ONE node, always present (even unconfigured), so
  * patchSyncStatus can swap its innerHTML without ever restructuring the
  * screen around a focused input.
  */
 function syncStatusInner(status) {
   const s = status || {};
+  const pending = Number(s.pending) || 0;
+
+  // One dot + one word lead the line; the dot never carries meaning alone.
+  // Quiet when healthy (dim facts), legible when not (the error breaks onto
+  // its own line in over + weight, and the dot goes red beside the words).
+  // While a push is in flight the dot pulses — the only live "loading" state
+  // this screen needs, driven by sync.onChange via patchSyncStatus.
+  let dot = "sync-dot--idle";
+  let lead = "";
+  if (!s.configured) {
+    lead = `<span class="sync-stat sync-stat--off">Not configured</span>`;
+  } else if (s.syncing) {
+    dot = "sync-dot--busy";
+    lead = `<span class="sync-stat">Syncing&hellip;</span>`;
+  } else if (s.lastErr) {
+    dot = "sync-dot--err";
+    lead = `<span class="sync-stat sync-stat--bad">Sync failing</span>`;
+  } else {
+    dot = "sync-dot--ok";
+    lead = `<span class="sync-stat">Connected</span>`;
+  }
+
   const bits = [
-    s.configured
-      ? `<span class="sync-stat">Configured</span>`
-      : `<span class="sync-stat sync-stat--off">Not configured</span>`,
-    `<span class="sync-stat">${Number(s.pending) || 0} pending</span>`,
-    s.lastOkAt
-      ? `<span class="sync-stat">Last sync ${esc(shortStamp(s.lastOkAt))}</span>`
-      : `<span class="sync-stat">Never synced</span>`,
+    `<span class="sync-dot ${esc(dot)}" aria-hidden="true"></span>`,
+    lead,
   ];
-  if (s.syncing) bits.push(`<span class="sync-stat">Syncing&hellip;</span>`);
+  if (s.configured) {
+    if (pending > 0)
+      bits.push(
+        `<span class="sync-stat">${num(pending, 0, 1e9)} pending</span>`,
+      );
+    bits.push(
+      s.lastOkAt
+        ? `<span class="sync-stat">Last sync ${esc(shortStamp(s.lastOkAt))}</span>`
+        : `<span class="sync-stat">Never synced</span>`,
+    );
+  }
   const err = s.lastErr
     ? `<span class="sync-error">${esc(s.lastErr)}</span>`
     : "";
@@ -372,8 +427,9 @@ export function renderSettingsScreen(vm) {
   const total = Number.isFinite(vm?.totalPct) ? vm.totalPct : 0;
   // Compared the way store.validateCategories compares, so the button state
   // and the actual write agree exactly — 33.33+33.33+33.34 must read as 100.
-  const balanced = Math.round(total * 1e6) === 100 * 1e6;
-  const totalText = Number.isInteger(total) ? String(total) : total.toFixed(2);
+  const parts = pctTotalParts(Math.round(total * 1e6));
+  const balanced = parts.balanced;
+  const totalText = parts.totalText;
 
   const catError = vm?.catError
     ? `<p class="settings-error">${esc(vm.catError)}</p>`
@@ -402,6 +458,7 @@ export function renderSettingsScreen(vm) {
       <div class="cat-rows">${cats.map(renderPctRow).join("")}</div>
       <div class="cat-total ${balanced ? "cat-total--ok" : "cat-total--bad"}">
         <span class="cat-total-label">Total</span>
+        <span class="cat-total-delta">${esc(parts.deltaText)}</span>
         <span class="cat-total-value num">${esc(totalText)}%</span>
       </div>
       ${catError}
@@ -453,10 +510,15 @@ export function renderSettingsScreen(vm) {
 /* History                                                              */
 /* -------------------------------------------------------------------- */
 
-/** Non-spend rows get a WORD, not just a colour — colour alone isn't a label. */
+/**
+ * Non-spend rows get a WORD, not just a colour — colour alone isn't a label.
+ * "Drawn" rather than "Withdrawal": at 390px the longer word forced the row
+ * to overflow, and shrinking the category to fit rendered "Save/Invest" as
+ * "S.". The pill has to stay (it's the non-colour signal), so the word gives.
+ */
 function kindTag(kind) {
   if (kind === "withdrawal")
-    return `<span class="txn-tag txn-tag--withdrawal">Withdrawal</span>`;
+    return `<span class="txn-tag txn-tag--withdrawal">Drawn</span>`;
   if (kind === "sweep")
     return `<span class="txn-tag txn-tag--sweep">Swept</span>`;
   if (kind === "income")
@@ -493,7 +555,7 @@ function renderMonthRow(m, openKey) {
       ? `<ul class="list txn-list">${(m.txns || []).map(renderTxnRow).join("")}</ul>`
       : `<p class="empty-title txn-empty">No transactions in ${esc(m.label)}.</p>`
     : "";
-  return `<li class="month-item ${open ? "month-item--open" : ""}" data-id="${esc(m.key)}">
+  return `<li class="month-item ${open ? "month-item--open" : ""} ${m.closed ? "month-item--closed" : ""}" data-id="${esc(m.key)}">
     <button class="month-head list-row" type="button" data-action="toggle-month"
       data-id="${esc(m.key)}" aria-expanded="${open ? "true" : "false"}">
       <span class="list-row-main">
@@ -523,7 +585,11 @@ export function renderHistoryScreen(vm) {
     return `<div class="screen screen-history">
       ${head}
       <div class="empty">
-        <p class="empty-title">Nothing here yet. Set an income and log an expense &mdash; months land here as they close.</p>
+        <span class="empty-glyph" aria-hidden="true">&#128337;</span>
+        <p class="empty-title">No months yet</p>
+        <p class="empty-sub">Set an income and log an expense &mdash; every month
+          lands here with its full transaction record as it closes.</p>
+        <button class="empty-cta btn btn-primary" type="button" data-action="go-home">Back to this month</button>
       </div>
     </div>`;
   }
@@ -634,21 +700,20 @@ export function patchPctTotal(root) {
     const n = Number(el.value);
     scaled += Math.round((Number.isFinite(n) ? n : 0) * 1e6);
   }
-  const total = scaled / 1e6;
-  const balanced = scaled === 100 * 1e6;
+  const parts = pctTotalParts(scaled);
 
   const value = root?.querySelector(".cat-total-value");
-  if (value) {
-    value.textContent = `${Number.isInteger(total) ? total : total.toFixed(2)}%`;
-  }
+  if (value) value.textContent = `${parts.totalText}%`;
+  const delta = root?.querySelector(".cat-total-delta");
+  if (delta) delta.textContent = parts.deltaText;
   const box = root?.querySelector(".cat-total");
   if (box) {
-    box.classList.toggle("cat-total--ok", balanced);
-    box.classList.toggle("cat-total--bad", !balanced);
+    box.classList.toggle("cat-total--ok", parts.balanced);
+    box.classList.toggle("cat-total--bad", !parts.balanced);
   }
   const save = root?.querySelector('[data-action="save-categories"]');
-  if (save) save.disabled = !balanced;
-  return total;
+  if (save) save.disabled = !parts.balanced;
+  return parts.total;
 }
 
 /** Replace an inline settings error message without re-rendering the screen. */
